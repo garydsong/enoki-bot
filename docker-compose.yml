@@ -1,0 +1,66 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: enoki
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-enoki}
+      POSTGRES_DB: enoki
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U enoki']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    # Published on LOOPBACK ONLY (127.0.0.1), not 0.0.0.0.
+    #
+    # This is what lets `npm run dev` on the host reach the database, which is
+    # the normal development loop. Binding to 127.0.0.1 rather than the bare
+    # "5432:5432" matters: the short form listens on every interface, which on a
+    # laptop means anyone on the same café or office network can reach your
+    # Postgres. The explicit loopback bind keeps it reachable only from this
+    # machine.
+    ports: ['127.0.0.1:5432:5432']
+
+  bot:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      DISCORD_TOKEN: ${DISCORD_TOKEN}
+      DISCORD_APPLICATION_ID: ${DISCORD_APPLICATION_ID}
+      DISCORD_DEV_GUILD_ID: ${DISCORD_DEV_GUILD_ID:-}
+      DATABASE_URL: postgres://enoki:${POSTGRES_PASSWORD:-enoki}@postgres:5432/enoki
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      HTTP_PORT: 3000
+
+volumes:
+  pgdata:
+
+  # ---------------------------------------------------------------------------
+  # Backup (opt-in): docker compose --profile backup run --rm backup
+  # ---------------------------------------------------------------------------
+  # A profile rather than a scheduled service, because a backup container that
+  # silently stops is worse than no backup container: it looks like protection.
+  # Drive it from the host's own cron or systemd timer, where a failure is
+  # visible, and see docs/RUNBOOK.md §4.
+  backup:
+    image: postgres:16-alpine
+    profiles: ['backup']
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:-enoki}
+    volumes:
+      - ./backups:/backups
+    entrypoint: ['sh', '-c']
+    command:
+      - >-
+        pg_dump -h postgres -U enoki --format=custom
+        --file=/backups/enoki-$$(date +%Y%m%d-%H%M%S).dump enoki
+        && echo "backup written to ./backups"

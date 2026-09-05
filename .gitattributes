@@ -1,0 +1,14 @@
+# Normalise line endings in the repository.
+* text=auto
+
+# Migrations are checksummed. The runner normalises line endings before hashing
+# (see src/platform/db/migrator.ts), so this is belt-and-braces — but keeping
+# them LF on disk means a Windows checkout and a Linux container agree
+# byte-for-byte, not merely semantically.
+*.sql text eol=lf
+
+# Shell scripts and Dockerfiles must be LF or they break inside containers.
+*.sh        text eol=lf
+Dockerfile  text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
