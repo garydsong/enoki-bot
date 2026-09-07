@@ -1,5 +1,7 @@
 # Enoki
 
+<img width="1254" height="1254" alt="enoki-icon-blue" src="https://github.com/user-attachments/assets/0ee4eb0c-c0b9-4ac8-9a23-6d63a255aa89" />
+
 A self-hostable, multi-guild Discord leveling bot. Members earn XP from messages, voice and reactions; XP becomes levels; levels become roles.
 
 > *Enoki* — mushrooms that grow in dense clusters, each stalk a little taller than it was yesterday. Communities do the same thing when you give them something to measure.
