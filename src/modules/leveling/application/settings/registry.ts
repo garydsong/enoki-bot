@@ -466,6 +466,13 @@ const CONFIG_SETTINGS: readonly SettingDefinition[] = [
     read: (c) => c.cards.backgroundUrl ?? 'none',
   },
   {
+    key: 'cards.leaderboard',
+    column: 'card_leaderboard_enabled',
+    kind: 'boolean',
+    description: 'Render /leaderboard as an image as well. Needs cards.enabled.',
+    read: (c) => yesNo(c.cards.leaderboard),
+  },
+  {
     key: 'cards.allowMemberCustomisation',
     column: 'card_allow_member_customisation',
     kind: 'boolean',

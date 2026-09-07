@@ -96,7 +96,19 @@ export class EnvValidationError extends Error {
  * problem at once, rather than failing on the first.
  */
 export function loadEnv(source: NodeJS.ProcessEnv = process.env): Env {
-  const result = EnvSchema.safeParse(source);
+  // Every PaaS — Railway, Render, Heroku, Fly — injects `PORT` and expects the
+  // process to bind to it. Nothing here serves public traffic, but the
+  // platform's health check does not know that, and a health check aimed at a
+  // port nothing is listening on reads as a dead deploy.
+  //
+  // `HTTP_PORT` still wins when it is set explicitly, so a local `.env` is
+  // unaffected and this is purely a fallback.
+  const withPlatformPort: NodeJS.ProcessEnv =
+    source['HTTP_PORT'] === undefined && source['PORT'] !== undefined
+      ? { ...source, HTTP_PORT: source['PORT'] }
+      : source;
+
+  const result = EnvSchema.safeParse(withPlatformPort);
   if (!result.success) {
     const issues = result.error.issues.map(
       (i) => `${i.path.join('.') || '(root)'}: ${i.message}`,

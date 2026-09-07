@@ -1,7 +1,5 @@
 # Enoki
 
-<img width="1254" height="1254" alt="enoki-icon-blue" src="https://github.com/user-attachments/assets/0ee4eb0c-c0b9-4ac8-9a23-6d63a255aa89" />
-
 A self-hostable, multi-guild Discord leveling bot. Members earn XP from messages, voice and reactions; XP becomes levels; levels become roles.
 
 > *Enoki* — mushrooms that grow in dense clusters, each stalk a little taller than it was yesterday. Communities do the same thing when you give them something to measure.
@@ -31,7 +29,7 @@ Built to a written specification — see **`docs/spec/`** (also in the Claude pr
 | **M14 — Rank cards** | ✅ done |
 | **M15 — Admin depth** | ✅ done — **the roadmap is complete** |
 
-**697 tests green** — unit, integration (real Postgres) and architecture.
+**735 tests green** — unit, integration (real Postgres) and architecture.
 
 Every milestone in `docs/spec/10-implementation-roadmap.md` is implemented:
 message, voice, reaction and manual XP; levels; level-up messages; role rewards
@@ -274,6 +272,7 @@ src/
     migrations/              the module's own tables, namespaced by module name
   platform/metrics/          dependency-free Prometheus registry
 docs/RUNBOOK.md              deploy, upgrade, back up, restore, incidents
+docs/DEPLOY-RAILWAY.md       hosting it in the cloud, step by step
     platform/                  module-agnostic bot core
       plugin/                  BotModule interface + registry
       db/                      pool, transactions, migration runner
@@ -314,6 +313,15 @@ tests/
 | `/xp forget [user]` | **everyone, for themselves** | Permanently delete leveling data |
 | `/xp audit [user] [actor] [action]` | Manage Server | Administrative changes, filterable |
 | `/card color\|background\|preview\|reset` | everyone | Personalise your rank card |
+
+When `cards.enabled` is on, `/rank` and `/leaderboard` are both rendered as
+images by the same renderer — same ground, same accent, same avatar treatment —
+so the individual card and the board read as one design. The board is a uniform
+ranked list: a podium for the top three would make page 1 prettier and every
+other page a different shape. `cards.leaderboard` turns the board's image off on
+its own, because a board page fetches up to twenty-five avatars where a rank
+card fetches one. Either way the pagination buttons are identical, and if the
+renderer declines the embed answers.
 | `/level debug why [user] [channel]` | Manage Server | Every gate a message would pass or fail |
 | `/level debug member [user]` | Manage Server | Everything stored about one member |
 | `/level debug rewards [user]` | Manage Server | Desired roles, the diff, and what is blocking |

@@ -127,3 +127,26 @@ describe('environment validation', () => {
     });
   });
 });
+
+/**
+ * Hosting platforms inject `PORT` and health-check it.
+ *
+ * Nothing in this bot serves public traffic, but a platform that probes a port
+ * nothing is listening on reports a dead deploy — so the health server has to
+ * bind where the platform says, not where the .env says.
+ */
+describe('PORT, as every PaaS injects it', () => {
+  it('binds the platform’s port when HTTP_PORT is not set', () => {
+    const env = loadEnv({ PORT: '8080' });
+    expect(env.HTTP_PORT).toBe(8080);
+  });
+
+  it('lets an explicit HTTP_PORT win, so a local .env is unaffected', () => {
+    const env = loadEnv({ PORT: '8080', HTTP_PORT: '3000' });
+    expect(env.HTTP_PORT).toBe(3000);
+  });
+
+  it('still defaults when neither is set', () => {
+    expect(loadEnv({}).HTTP_PORT).toBe(3000);
+  });
+})

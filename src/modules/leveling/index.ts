@@ -198,6 +198,9 @@ export function createLevelingModule(options: {
     get configs() {
       return use().configs;
     },
+    get renderer() {
+      return use().renderer;
+    },
   };
 
   const levelDeps = {

@@ -7,6 +7,12 @@ COPY package*.json ./
 RUN npm ci
 COPY tsconfig*.json ./
 COPY src ./src
+# `npm run build` is tsc AND scripts/copy-assets.mjs, which copies the .sql
+# files into dist/. Forgetting this directory is not a build warning — it is
+# MODULE_NOT_FOUND, and before the copy script existed it was worse: the image
+# built cleanly and shipped with zero module migrations. Covered by a test that
+# reads this file against the build script.
+COPY scripts ./scripts
 RUN npm run build
 
 # ---- runtime --------------------------------------------------------------

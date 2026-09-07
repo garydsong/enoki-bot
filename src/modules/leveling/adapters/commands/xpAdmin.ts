@@ -198,11 +198,13 @@ function buildData() {
       sub
         .setName('forget')
         .setDescription('Permanently delete a member’s leveling data')
-        .addUserOption((o) =>
-          o.setName('user').setDescription('Who (members may only name themselves)'),
-        )
+        // `confirm` is required, so it MUST come first — Discord rejects the
+        // whole command set when a required option follows an optional one.
         .addBooleanOption((o) =>
           o.setName('confirm').setDescription('This cannot be undone').setRequired(true),
+        )
+        .addUserOption((o) =>
+          o.setName('user').setDescription('Who (members may only name themselves)'),
         ),
     )
     .addSubcommand((sub) =>

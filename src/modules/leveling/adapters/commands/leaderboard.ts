@@ -1,5 +1,6 @@
 import {
   ActionRowBuilder,
+  AttachmentBuilder,
   ButtonBuilder,
   ButtonStyle,
   EmbedBuilder,
@@ -19,6 +20,8 @@ import {
   type LeaderboardService,
 } from '../../application/queries/leaderboard.js';
 import type { ConfigCache } from '../../ports/config.js';
+import type { CardRenderer } from '../../ports/cards.js';
+import { avatarUrlFor } from '../../domain/net/discordCdn.js';
 import type { GuildLevelingConfig } from '../../domain/types.js';
 import { escapeMarkdown, formatDuration, formatNumber, rankBadge } from './format.js';
 
@@ -50,6 +53,7 @@ const METRIC_CHOICES: readonly { name: string; value: LeaderboardMetric }[] = [
 export interface LeaderboardCommandDeps {
   readonly boards: LeaderboardService;
   readonly configs: ConfigCache;
+  readonly renderer: CardRenderer;
 }
 
 export function createLeaderboardCommand(deps: LeaderboardCommandDeps): CommandDefinition {
@@ -94,7 +98,13 @@ export function createLeaderboardCommand(deps: LeaderboardCommandDeps): CommandD
       });
 
       await interaction.editReply(
-        render(result, config, interaction.guildId, interaction.user.id, interaction.guild?.name),
+        await render(deps, {
+          result,
+          config,
+          ownerId: interaction.user.id,
+          viewerId: interaction.user.id,
+          guildName: interaction.guild?.name,
+        }),
       );
     },
   };
@@ -137,7 +147,13 @@ export function createLeaderboardComponent(deps: LeaderboardCommandDeps): Compon
           config,
         });
         await interaction.editReply(
-          render(result, config, interaction.guildId, interaction.user.id, interaction.guild?.name),
+          await render(deps, {
+            result,
+            config,
+            ownerId: interaction.user.id,
+            viewerId: interaction.user.id,
+            guildName: interaction.guild?.name,
+          }),
         );
         return;
       }
@@ -149,13 +165,15 @@ export function createLeaderboardComponent(deps: LeaderboardCommandDeps): Compon
         config,
       });
 
-      const payload = render(
+      // The OWNER keeps the buttons on the shared message; the highlighted row
+      // follows whoever is looking, which for an ephemeral copy is the presser.
+      const payload = await render(deps, {
         result,
         config,
-        interaction.guildId,
-        parsed.ownerId,
-        interaction.guild?.name,
-      );
+        ownerId: parsed.ownerId,
+        viewerId: interaction.user.id,
+        guildName: interaction.guild?.name,
+      });
 
       if (isOwner) {
         await interaction.update(payload);
@@ -251,16 +269,79 @@ export function customIdsFor(result: LeaderboardPage, ownerId: string): string[]
 
 interface RenderedBoard {
   readonly embeds: EmbedBuilder[];
+  readonly files: AttachmentBuilder[];
+  /**
+   * Always present, even when empty.
+   *
+   * A payload that OMITS `attachments` on an edit leaves the previous image
+   * attached — so paging from an image board to an embed one (the renderer
+   * fell back mid-session) would show the old page's picture above the new
+   * page's text. Sending `[]` is what drops it.
+   */
+  readonly attachments: never[];
   readonly components: ActionRowBuilder<ButtonBuilder>[];
 }
 
-function render(
-  result: LeaderboardPage,
-  config: GuildLevelingConfig,
-  _guildId: string,
-  ownerId: string,
-  guildName: string | undefined,
-): RenderedBoard {
+interface RenderContext {
+  readonly result: LeaderboardPage;
+  readonly config: GuildLevelingConfig;
+  readonly ownerId: string;
+  /** Whose row to highlight — the person looking, not the person who opened it. */
+  readonly viewerId: string;
+  readonly guildName: string | undefined;
+}
+
+/**
+ * The board, as an image when cards are on and as an embed otherwise.
+ *
+ * THE IMAGE IS AN ENHANCEMENT, NEVER A DEPENDENCY — the same rule as `/rank`.
+ * The renderer returns null on a slow CDN, a missing font or a budget overrun,
+ * and the embed below answers regardless. The buttons are attached either way,
+ * so pagination behaves identically in both modes.
+ */
+async function render(deps: LeaderboardCommandDeps, ctx: RenderContext): Promise<RenderedBoard> {
+  const { result, config, ownerId, guildName } = ctx;
+  const components = [buttons(result, ownerId)];
+
+  if (config.cards.enabled && config.cards.leaderboard && result.entries.length > 0) {
+    const png = await deps.renderer.renderLeaderboard(
+      {
+        title: guildName ?? 'Leaderboard',
+        metricLabel: metricLabel(result.metric),
+        page: result.page,
+        totalPages: result.totalPages,
+        totalRanked: result.totalRanked,
+        note: config.hideDepartedMembers ? 'departed members hidden' : null,
+        rows: result.entries.map((entry) => ({
+          rank: entry.rank,
+          // The stored snapshot, so a member who has LEFT still renders as a
+          // name and a face rather than a snowflake and a hole.
+          displayName: entry.displayName ?? `User ${entry.userId.slice(-4)}`,
+          avatarUrl: avatarUrlFor(entry.userId, entry.avatarHash),
+          value: formatValue(result.metric, entry.value),
+          // Suppressed on the level board, where the value already IS the
+          // level — a row reading `member  Lv 42 … level 42` says it twice.
+          level: result.metric === 'level' ? null : entry.level,
+          isDeparted: entry.isDeparted,
+          isViewer: entry.userId === ctx.viewerId,
+        })),
+      },
+      {
+        accentColor: config.cards.accentColor,
+        backgroundUrl: config.cards.backgroundUrl,
+      },
+    );
+
+    if (png) {
+      return {
+        embeds: [],
+        files: [new AttachmentBuilder(png, { name: 'leaderboard.png' })],
+        attachments: [],
+        components,
+      };
+    }
+  }
+
   const embed = new EmbedBuilder()
     .setTitle(`${guildName ? `${guildName} — ` : ''}${metricLabel(result.metric)}`)
     .setDescription(
@@ -272,7 +353,12 @@ function render(
                 ? escapeMarkdown(entry.displayName)
                 : `<@${entry.userId}>`;
               const departed = entry.isDeparted ? ' *(left)*' : '';
-              return `${rankBadge(entry.rank)} **${name}**${departed} — ${formatValue(
+              // The level appears here TOO. The embed is what people see when
+              // the renderer declines, and a fallback that says less than the
+              // thing it replaces makes the fallback look broken.
+              const level =
+                result.metric === 'level' ? '' : ` \`Lv ${formatNumber(entry.level)}\``;
+              return `${rankBadge(entry.rank)} **${name}**${level}${departed} — ${formatValue(
                 result.metric,
                 entry.value,
               )}`;
@@ -288,9 +374,11 @@ function render(
 
   return {
     embeds: [embed],
+    files: [],
+    attachments: [],
     // One row is always attached, even on a single-page board: "Jump to me"
     // is useful there too, and a disappearing control reads as a bug.
-    components: [buttons(result, ownerId)],
+    components,
   };
 }
 
