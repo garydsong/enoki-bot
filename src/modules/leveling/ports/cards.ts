@@ -27,6 +27,35 @@ export interface CardSubject {
   readonly isMaxLevel: boolean;
 }
 
+export interface LeaderboardCardRow {
+  readonly rank: number;
+  readonly displayName: string;
+  readonly avatarUrl: string;
+  /** Already formatted for the metric — "12,480 XP", "3h 20m", "level 42". */
+  readonly value: string;
+  /**
+   * Drawn as a small pill beside the name.
+   *
+   * Null means "do not show it", which is what the level board itself passes:
+   * a row reading `member  Lv 42 … level 42` says the same thing twice.
+   */
+  readonly level: number | null;
+  readonly isDeparted: boolean;
+  /** True for the member who ran the command, who gets their row highlighted. */
+  readonly isViewer: boolean;
+}
+
+export interface LeaderboardCardSubject {
+  readonly title: string;
+  /** "Total XP", "Voice time" — the board being shown. */
+  readonly metricLabel: string;
+  readonly rows: readonly LeaderboardCardRow[];
+  readonly page: number;
+  readonly totalPages: number;
+  readonly totalRanked: number;
+  readonly note: string | null;
+}
+
 export interface CardRenderer {
   /**
    * Render a PNG, or null if it could not be produced in time.
@@ -35,6 +64,16 @@ export interface CardRenderer {
    * font, an unreadable background. The caller falls back to the embed.
    */
   render(subject: CardSubject, style: CardStyle): Promise<Buffer | null>;
+
+  /**
+   * The same, for a page of the leaderboard.
+   *
+   * Shares the renderer — and therefore the font resolution, the image cache
+   * and the budget — with the rank card, because the two being visually
+   * consistent means they must be drawn by the same code, not by two files
+   * that agree today.
+   */
+  renderLeaderboard(subject: LeaderboardCardSubject, style: CardStyle): Promise<Buffer | null>;
 }
 
 export interface MemberCardConfig {

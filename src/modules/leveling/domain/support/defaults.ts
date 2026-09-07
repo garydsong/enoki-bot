@@ -68,6 +68,7 @@ export const DEFAULT_LEVELING_CONFIG: GuildLevelingConfig = {
     accentColor: 0x5865f2,
     backgroundUrl: null,
     allowMemberCustomisation: true,
+    leaderboard: true,
   },
   rewardStacking: 'stack',
   removeOnLevelDown: true,

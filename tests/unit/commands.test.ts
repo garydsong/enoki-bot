@@ -19,6 +19,9 @@ const commands = module_.commands ?? [];
 interface OptionLike {
   name: string;
   description: string;
+  /** 1 = subcommand, 2 = subcommand group; neither carries `required`. */
+  type?: number;
+  required?: boolean;
   options?: OptionLike[];
   choices?: { name: string; value: string | number }[];
   autocomplete?: boolean;
@@ -98,6 +101,45 @@ describe('the leveling module’s command surface', () => {
 
     for (const command of commands) {
       expect(size(command.data as Sizeable), command.name).toBeLessThan(8_000);
+    }
+  });
+
+  /**
+   * THE ONE THAT SHIPPED BROKEN, TWICE OVER NOW.
+   *
+   * Discord requires every required option to precede every optional one, and
+   * rejects the ENTIRE command set with a 400 if any single subcommand gets it
+   * wrong — so one misordered option takes the whole bot down at boot, in front
+   * of whoever is running it, with an error that names a JSON index rather than
+   * a subcommand. discord.js does not check this when building the payload.
+   *
+   * `/xp forget` had `user` (optional) before `confirm` (required) and failed
+   * exactly that way. Asserted here for every option list in the module.
+   */
+  it('puts every required option before every optional one', () => {
+    const check = (options: OptionLike[] | undefined, path: string): void => {
+      let seenOptional: string | null = null;
+      for (const option of options ?? []) {
+        // Subcommands and groups (types 1 and 2) carry no `required` flag and
+        // are ordered freely; recurse into them and skip the check itself.
+        if (option.type === 1 || option.type === 2) {
+          check(option.options, `${path} ${option.name}`);
+          continue;
+        }
+        if (option.required === true && seenOptional !== null) {
+          throw new Error(
+            `${path}: required option "${option.name}" comes after optional ` +
+              `"${seenOptional}". Discord refuses the whole command set for this.`,
+          );
+        }
+        if (option.required !== true) seenOptional = option.name;
+      }
+    };
+
+    for (const command of commands) {
+      expect(() =>
+        check((command.data as { options?: OptionLike[] }).options, `/${command.name}`),
+      ).not.toThrow();
     }
   });
 

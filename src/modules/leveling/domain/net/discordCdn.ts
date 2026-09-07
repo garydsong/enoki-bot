@@ -35,6 +35,40 @@ export type DiscordCdnValidation =
   | { readonly ok: true; readonly url: string }
   | { readonly ok: false; readonly reason: DiscordCdnRejection };
 
+/**
+ * A member's avatar URL, built from the snapshot we already store.
+ *
+ * The leaderboard card needs ten avatars per page and must not spend ten
+ * Discord API calls to get them. `member_xp.avatar_hash` is written on every
+ * award for exactly this kind of use, so the URL is derived rather than
+ * fetched — which also means a member who has LEFT still renders with a face
+ * instead of a hole.
+ *
+ * A null hash means they have never set an avatar. Discord serves a default
+ * from a fixed set, indexed by `(id >> 22) % 6` under the current username
+ * system — computed with BigInt because a snowflake exceeds
+ * `Number.MAX_SAFE_INTEGER` and shifting it as a JS number gives the wrong
+ * bucket. Both forms live on `cdn.discordapp.com`, so both pass the allowlist
+ * above without a special case.
+ */
+export function avatarUrlFor(userId: string, avatarHash: string | null, size = 64): string {
+  if (avatarHash === null || avatarHash === '') {
+    let index = 0;
+    try {
+      index = Number((BigInt(userId) >> 22n) % 6n);
+    } catch {
+      // Not a snowflake (a test fixture, a hand-edited row). Any default will
+      // do; refusing to draw a card over it would not.
+      index = 0;
+    }
+    return `https://cdn.discordapp.com/embed/avatars/${index}.png`;
+  }
+
+  // `a_`-prefixed hashes are animated. We ask for .png regardless: the card is
+  // a still image, and Discord serves the first frame.
+  return `https://cdn.discordapp.com/avatars/${userId}/${avatarHash}.png?size=${size}`;
+}
+
 export function validateDiscordCdnUrl(raw: string): DiscordCdnValidation {
   let parsed: URL;
   try {

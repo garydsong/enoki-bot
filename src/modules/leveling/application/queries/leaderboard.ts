@@ -28,6 +28,8 @@ export interface LeaderboardEntry {
   readonly rank: number;
   readonly userId: string;
   readonly displayName: string | null;
+  /** The snapshot from `member_xp`. Null means they never set one. */
+  readonly avatarHash: string | null;
   readonly isDeparted: boolean;
   readonly value: number;
   /** Level, for metrics where showing it alongside is useful. */
@@ -110,6 +112,7 @@ export function createLeaderboardService(db: Database): LeaderboardService {
           rank: offset + index + 1,
           userId: row.user_id,
           displayName: row.display_name,
+          avatarHash: row.avatar_hash,
           isDeparted: row.is_departed ?? false,
           value: Number(row.value),
           level: row.level ?? 0,
@@ -133,6 +136,7 @@ export function createLeaderboardService(db: Database): LeaderboardService {
 interface RawEntry {
   user_id: string;
   display_name: string | null;
+  avatar_hash: string | null;
   is_departed: boolean | null;
   value: string;
   level: number | null;
@@ -185,6 +189,7 @@ function buildQuery(
   const sql = `
     SELECT t.user_id,
            ${nameSource}.display_name AS display_name,
+           ${nameSource}.avatar_hash  AS avatar_hash,
            ${nameSource}.is_departed  AS is_departed,
            t.${spec.column}           AS value,
            ${spec.table === 'member_xp' ? 't.level' : 'COALESCE(m.level, 0)'} AS level

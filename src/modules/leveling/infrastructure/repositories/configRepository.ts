@@ -322,6 +322,7 @@ function assemble(
         ? raw['card_background_url']
         : null,
       allowMemberCustomisation: bool('card_allow_member_customisation', true),
+      leaderboard: bool('card_leaderboard_enabled', true),
     },
 
     rewardStacking: str('reward_stacking', 'stack'),

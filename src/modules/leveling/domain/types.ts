@@ -136,6 +136,8 @@ export interface CardsConfig {
   readonly accentColor: number;
   readonly backgroundUrl: string | null;
   readonly allowMemberCustomisation: boolean;
+  /** Render `/leaderboard` as an image too. Gated behind `enabled`. */
+  readonly leaderboard: boolean;
 }
 
 export interface GuildLevelingConfig {
