@@ -92,8 +92,21 @@ export async function loadMigrations(
     let entries: string[];
     try {
       entries = await readdir(dir);
-    } catch {
-      continue; // a module may declare a migrations dir before it has any
+    } catch (error) {
+      // A DECLARED-BUT-MISSING directory is a build problem, not an empty
+      // module, and swallowing it is how a production image ends up running
+      // with half a schema: `tsc` does not copy .sql files, so a build that
+      // forgets to would silently apply no module migrations at all and then
+      // fail every query with "relation does not exist".
+      //
+      // An EMPTY directory is still fine — that is the "no migrations yet" case.
+      throw new MigrationError(
+        `migrations directory not found: ${dir}\n` +
+          `Namespace "${namespace}" declared it, but nothing is there. ` +
+          `In a built image this usually means the .sql files were not copied ` +
+          `into dist/ — check that \`npm run build\` ran scripts/copy-assets.mjs. ` +
+          `(${error instanceof Error ? error.message : String(error)})`,
+      );
     }
 
     for (const entry of entries.filter((e) => e.endsWith('.sql')).sort()) {

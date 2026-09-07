@@ -26,6 +26,7 @@ import type {
 } from '../../ports/config.js';
 import { formatNumber } from './format.js';
 import { handleDebug, type LevelDebugDeps } from './levelDebug.js';
+import { handleBackfill, type BackfillCommandDeps } from './rewardBackfill.js';
 
 /**
  * `/level` — the whole admin surface (spec `03` §4.2, M5).
@@ -40,7 +41,7 @@ import { handleDebug, type LevelDebugDeps } from './levelDebug.js';
  * an admin can accidentally expose the entire configuration surface to everyone.
  */
 
-export interface LevelAdminDeps extends LevelDebugDeps {
+export interface LevelAdminDeps extends LevelDebugDeps, BackfillCommandDeps {
   readonly config: ConfigRepository;
   readonly rules: RuleRepository;
   readonly audit: AuditRepository;
@@ -106,10 +107,16 @@ export function createLevelCommand(deps: LevelAdminDeps): CommandDefinition {
           return removeBoost(interaction, deps, ctx);
         case 'reward/add':
           return addReward(interaction, deps, ctx);
+        case 'reward/add-recurring':
+          return addRecurringReward(interaction, deps, ctx);
         case 'reward/remove':
           return removeReward(interaction, deps, ctx);
+        case 'reward/remove-recurring':
+          return removeRecurringReward(interaction, deps, ctx);
         case 'reward/list':
           return listRewards(interaction, deps);
+        case 'reward/backfill':
+          return handleBackfill(interaction, deps, ctx);
         case 'debug/why':
         case 'debug/member':
         case 'debug/rewards':
@@ -292,6 +299,30 @@ function buildData() {
         )
         .addSubcommand((sub) =>
           sub
+            .setName('add-recurring')
+            .setDescription('Grant a role at a level, and again every N levels')
+            .addRoleOption((option) =>
+              option.setName('role').setDescription('The role to grant').setRequired(true),
+            )
+            .addIntegerOption((option) =>
+              option
+                .setName('start')
+                .setDescription('The first level that grants it')
+                .setRequired(true)
+                .setMinValue(1)
+                .setMaxValue(100_000),
+            )
+            .addIntegerOption((option) =>
+              option
+                .setName('every')
+                .setDescription('Levels between repeats')
+                .setRequired(true)
+                .setMinValue(1)
+                .setMaxValue(100_000),
+            ),
+        )
+        .addSubcommand((sub) =>
+          sub
             .setName('remove')
             .setDescription('Stop granting a role')
             .addIntegerOption((option) =>
@@ -305,7 +336,30 @@ function buildData() {
               option.setName('role').setDescription('Only this role (default: all at that level)'),
             ),
         )
-        .addSubcommand((sub) => sub.setName('list').setDescription('List reward roles')),
+        .addSubcommand((sub) =>
+          sub
+            .setName('remove-recurring')
+            .setDescription('Remove a recurring reward rule')
+            .addRoleOption((option) =>
+              option.setName('role').setDescription('Only this role (default: all recurring rules)'),
+            ),
+        )
+        .addSubcommand((sub) => sub.setName('list').setDescription('List reward roles'))
+        .addSubcommand((sub) =>
+          sub
+            .setName('backfill')
+            .setDescription('Give everyone the reward roles their level already earned')
+            .addBooleanOption((option) =>
+              option
+                .setName('apply')
+                .setDescription('Actually change roles (default: show what would change)'),
+            )
+            .addBooleanOption((option) =>
+              option
+                .setName('include-departed')
+                .setDescription('Also visit members who have left the server'),
+            ),
+        ),
     )
 
     .addSubcommandGroup((group) =>
@@ -784,6 +838,51 @@ function describeRule(rule: XpRule): string {
 // rewards
 // ---------------------------------------------------------------------------
 
+/**
+ * Why this role cannot be a reward, or null.
+ *
+ * Checked BEFORE storing, because a rule the bot can never apply is worse than
+ * a refusal: it looks configured and silently does nothing. Shared by both the
+ * exact and the recurring rule, which is the point of extracting it — the
+ * `@everyone` bug that shipped in M7 was one branch missing from one path.
+ */
+function whyUnusableAsReward(
+  interaction: ChatInputCommandInteraction,
+  roleId: string,
+): string | null {
+  const guildId = interaction.guildId as string;
+  const me = interaction.guild?.members.me;
+  const guildRole = interaction.guild?.roles.cache.get(roleId);
+
+  // @everyone. Its id is the guild's id, every member already has it, and
+  // Discord rejects adding or removing it — but it sits at position 0, so the
+  // hierarchy check below would happily accept it.
+  if (roleId === guildId) {
+    return (
+      '`@everyone` cannot be a reward: every member already has it and Discord ' +
+      'does not allow it to be granted or removed.\n' +
+      'Create a normal role for the reward, and make sure my own role sits above it.'
+    );
+  }
+
+  if (guildRole?.managed) {
+    return (
+      `**${guildRole.name}** is managed by an integration (a bot, Nitro Boost, or a ` +
+      'subscription), and Discord does not allow anyone to assign it.'
+    );
+  }
+  if (me && guildRole && guildRole.position >= me.roles.highest.position) {
+    return (
+      `I cannot grant **${guildRole.name}** because it sits above my own highest role.\n` +
+      'Move my role above it in **Server Settings → Roles**, then run this again.'
+    );
+  }
+  if (me && !me.permissions.has(PermissionFlagsBits.ManageRoles)) {
+    return 'I need the **Manage Roles** permission before I can grant reward roles.';
+  }
+  return null;
+}
+
 async function addReward(
   interaction: ChatInputCommandInteraction,
   deps: LevelAdminDeps,
@@ -793,41 +892,9 @@ async function addReward(
   const level = interaction.options.getInteger('level', true);
   const role = interaction.options.getRole('role', true);
 
-  // Checked BEFORE storing: a rule the bot can never apply is worse than a
-  // refusal, because it looks configured and silently does nothing.
-  const me = interaction.guild?.members.me;
-  const guildRole = interaction.guild?.roles.cache.get(role.id);
-
-  // @everyone. Its id is the guild's id, every member already has it, and
-  // Discord rejects adding or removing it — but it sits at position 0, so the
-  // hierarchy check below would happily accept it.
-  if (role.id === guildId) {
-    await interaction.editReply(
-      '`@everyone` cannot be a reward: every member already has it and Discord ' +
-        'does not allow it to be granted or removed.\n' +
-        'Create a normal role for the reward, and make sure my own role sits above it.',
-    );
-    return;
-  }
-
-  if (guildRole?.managed) {
-    await interaction.editReply(
-      `**${guildRole.name}** is managed by an integration (a bot, Nitro Boost, or a ` +
-        'subscription), and Discord does not allow anyone to assign it.',
-    );
-    return;
-  }
-  if (me && guildRole && guildRole.position >= me.roles.highest.position) {
-    await interaction.editReply(
-      `I cannot grant **${guildRole.name}** because it sits above my own highest role.\n` +
-        'Move my role above it in **Server Settings → Roles**, then run this again.',
-    );
-    return;
-  }
-  if (me && !me.permissions.has(PermissionFlagsBits.ManageRoles)) {
-    await interaction.editReply(
-      'I need the **Manage Roles** permission before I can grant reward roles.',
-    );
+  const problem = whyUnusableAsReward(interaction, role.id);
+  if (problem) {
+    await interaction.editReply(problem);
     return;
   }
 
@@ -880,6 +947,88 @@ async function removeReward(
   );
 }
 
+/**
+ * `/level reward add-recurring` — "…and again every N levels".
+ *
+ * Arcane parity, and the reason it is worth having: a server that wants a role
+ * at 5, 10, 15, 20 … up to 100 otherwise needs twenty rules, each of which is a
+ * row an admin has to remember to extend when someone finally gets there.
+ *
+ * Because it is ONE role granted repeatedly, the member simply holds it from
+ * the start level onwards; the step decides where the rule ranks when stacking
+ * is `highest`. The reply says so, because "every 10 levels" sounds like it
+ * ought to do something visible at each iteration.
+ */
+async function addRecurringReward(
+  interaction: ChatInputCommandInteraction,
+  deps: LevelAdminDeps,
+  ctx: ModuleContext,
+): Promise<void> {
+  const guildId = interaction.guildId as string;
+  const everyN = interaction.options.getInteger('every', true);
+  const startLevel = interaction.options.getInteger('start', true);
+  const role = interaction.options.getRole('role', true);
+
+  const problem = whyUnusableAsReward(interaction, role.id);
+  if (problem) {
+    await interaction.editReply(problem);
+    return;
+  }
+
+  await deps.rules.addRecurringReward(guildId, everyN, startLevel, role.id, interaction.user.id);
+  deps.configs.invalidate(guildId);
+  await deps.audit.record(guildId, {
+    actorId: interaction.user.id,
+    action: 'reward.add_recurring',
+    after: { everyN, startLevel, roleId: role.id },
+  });
+
+  ctx.log.info({ guildId, everyN, startLevel, roleId: role.id }, 'recurring reward added');
+
+  const config = await deps.configs.get(guildId);
+  await interaction.editReply(
+    `<@&${role.id}> is now granted at level ${formatNumber(startLevel)}, and again every ` +
+      `${formatNumber(everyN)} levels after that.\n` +
+      'Since it is the same role each time, members simply keep it once they reach ' +
+      `level ${formatNumber(startLevel)}.` +
+      (config.rewardStacking === 'highest'
+        ? '\n\nStacking is **highest**, so each iteration re-establishes this role as ' +
+          'the top one — which is what makes a recurring rule useful in that mode.'
+        : ''),
+  );
+}
+
+async function removeRecurringReward(
+  interaction: ChatInputCommandInteraction,
+  deps: LevelAdminDeps,
+  ctx: ModuleContext,
+): Promise<void> {
+  const guildId = interaction.guildId as string;
+  const role = interaction.options.getRole('role');
+
+  const removed = await deps.rules.removeRecurringReward(guildId, role?.id);
+  deps.configs.invalidate(guildId);
+
+  if (removed === 0) {
+    await interaction.editReply(
+      role ? `<@&${role.id}> has no recurring rule.` : 'There are no recurring reward rules.',
+    );
+    return;
+  }
+
+  await deps.audit.record(guildId, {
+    actorId: interaction.user.id,
+    action: 'reward.remove_recurring',
+    before: { roleId: role?.id ?? null },
+  });
+  ctx.log.info({ guildId, roleId: role?.id ?? null }, 'recurring reward removed');
+
+  await interaction.editReply(
+    `Removed ${removed} recurring rule(s).\n` +
+      'Members who already hold the role keep it until their roles are next reconciled.',
+  );
+}
+
 async function listRewards(
   interaction: ChatInputCommandInteraction,
   deps: LevelAdminDeps,
@@ -894,6 +1043,11 @@ async function listRewards(
     return;
   }
 
+  const describe = (r: { type: string; level: number; everyN: number | null }): string =>
+    r.type === 'recurring'
+      ? `Level ${formatNumber(r.level)}, then every ${formatNumber(r.everyN ?? 1)}`
+      : `Level ${formatNumber(r.level)}`;
+
   const working = rewards.filter((r) => r.brokenReason === null);
   const broken = rewards.filter((r) => r.brokenReason !== null);
 
@@ -903,7 +1057,7 @@ async function listRewards(
       working.length === 0
         ? '*none*'
         : working
-            .map((r) => `Level ${formatNumber(r.level)} → <@&${r.roleId}>`)
+            .map((r) => `${describe(r)} → <@&${r.roleId}>`)
             .join('\n')
             .slice(0, 1024),
   });
@@ -914,7 +1068,7 @@ async function listRewards(
     embed.addFields({
       name: '⚠️ Not working',
       value: broken
-        .map((r) => `Level ${formatNumber(r.level)} → <@&${r.roleId}> — ${explainBroken(r.brokenReason)}`)
+        .map((r) => `${describe(r)} → <@&${r.roleId}> — ${explainBroken(r.brokenReason)}`)
         .join('\n')
         .slice(0, 1024),
     });

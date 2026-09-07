@@ -175,4 +175,25 @@ export default tseslint.config(
     files: ['src/main.ts', 'src/platform/logging/**/*.ts', 'src/platform/config/**/*.ts'],
     rules: { 'no-console': 'off' },
   },
+
+  // ---------------------------------------------------------------------------
+  // Build scripts — plain Node, deliberately OUTSIDE the TypeScript project.
+  //
+  // `scripts/copy-assets.mjs` runs before tsc has produced anything, so it is
+  // not part of any tsconfig and the type-aware rules have no program to ask.
+  // Linting it with the untyped rules keeps it checked (unused vars, syntax)
+  // without pretending it is application code.
+  // ---------------------------------------------------------------------------
+  {
+    files: ['scripts/**/*.mjs', 'scripts/**/*.js'],
+    ...tseslint.configs.disableTypeChecked,
+    languageOptions: {
+      parserOptions: { projectService: false, project: false },
+    },
+    rules: {
+      ...tseslint.configs.disableTypeChecked.rules,
+      'no-console': 'off',
+      'no-undef': 'off',
+    },
+  },
 );

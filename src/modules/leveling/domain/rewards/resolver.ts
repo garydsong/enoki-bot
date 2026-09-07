@@ -27,11 +27,22 @@ function ruleThreshold(rule: RoleRewardRule): number {
   return rule.type === 'exact' ? rule.level : rule.startLevel;
 }
 
+/**
+ * Has this rule been earned at `level`?
+ *
+ * For a RECURRING rule the answer is simply "have you reached the first
+ * iteration": the rule names ONE role granted again at every Nth level, and a
+ * member either holds that role or does not — there is no way to hold it twice.
+ * The `everyN` step matters only to `attainedThreshold`, which decides where
+ * the rule sits when stacking is `highest`.
+ *
+ * (This used to read `(level - startLevel) % everyN === 0 || level > startLevel`,
+ * which computes exactly the same thing while implying the modulo does work.)
+ */
 function ruleQualifies(rule: RoleRewardRule, level: number): boolean {
   if (rule.type === 'exact') return level >= rule.level;
-  if (level < rule.startLevel) return false;
   if (rule.everyN <= 0) return false;
-  return (level - rule.startLevel) % rule.everyN === 0 || level > rule.startLevel;
+  return level >= rule.startLevel;
 }
 
 /**

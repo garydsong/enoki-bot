@@ -45,20 +45,31 @@ import {
 } from './adapters/listeners/rewardLifecycle.js';
 import { createRewardHealthJob } from './adapters/jobs/rewardHealth.js';
 import { createRetentionJob, type RetentionOptions } from './adapters/jobs/retention.js';
+import { createHighlightsJob } from './adapters/jobs/highlights.js';
 import {
   createVoiceStateListener,
   createVoiceTickJob,
   currentVoiceSnapshots,
 } from './adapters/listeners/voiceState.js';
 import { createVoiceService, type VoiceService } from './application/voiceService.js';
+import { createReactionService, type ReactionService } from './application/reactionService.js';
+import { createReactionListener } from './adapters/listeners/messageReaction.js';
+import { createReactionAwardRepository } from './infrastructure/repositories/reactionAwardRepository.js';
 import { createVoiceSessionRepository } from './infrastructure/repositories/voiceSessionRepository.js';
 import { createRankCommand } from './adapters/commands/rank.js';
+import { createCardCommand } from './adapters/commands/card.js';
+import { createCanvasCardRenderer } from './infrastructure/rendering/canvasCardRenderer.js';
+import { createCardConfigRepository } from './infrastructure/repositories/cardConfigRepository.js';
+import type { CardConfigRepository, CardRenderer } from './ports/cards.js';
 import {
   createLeaderboardCommand,
   createLeaderboardComponent,
 } from './adapters/commands/leaderboard.js';
 import { createLevelCommand } from './adapters/commands/levelAdmin.js';
 import { createXpCommand } from './adapters/commands/xpAdmin.js';
+import { createBackfillComponent } from './adapters/commands/rewardBackfill.js';
+import { createRewardBackfill, type RewardBackfill } from './application/rewardBackfill.js';
+import { createXpImporter, type XpImporter } from './application/xpImport.js';
 
 /**
  * The leveling module (ADR-013).
@@ -93,6 +104,11 @@ interface LevelingServices {
   readonly notifier: LevelUpNotifier;
   readonly cooldowns: CooldownStore;
   readonly voice: VoiceService;
+  readonly reactions: ReactionService;
+  readonly cards: CardConfigRepository;
+  readonly renderer: CardRenderer;
+  readonly backfill: RewardBackfill;
+  readonly importer: XpImporter;
   readonly stopSweeping: () => void;
 }
 
@@ -152,6 +168,27 @@ export function createLevelingModule(options: {
     get reconciler() {
       return use().reconciler;
     },
+    get cards() {
+      return use().cards;
+    },
+    get renderer() {
+      return use().renderer;
+    },
+  };
+
+  const cardDeps = {
+    get db() {
+      return use().db;
+    },
+    get configs() {
+      return use().configs;
+    },
+    get cards() {
+      return use().cards;
+    },
+    get renderer() {
+      return use().renderer;
+    },
   };
 
   const boardDeps = {
@@ -185,6 +222,9 @@ export function createLevelingModule(options: {
     get cooldowns() {
       return use().cooldowns;
     },
+    get backfill() {
+      return use().backfill;
+    },
   };
 
   const xpDeps = {
@@ -203,6 +243,15 @@ export function createLevelingModule(options: {
     get audit() {
       return use().audit;
     },
+    get importer() {
+      return use().importer;
+    },
+  };
+
+  const backfillDeps = {
+    get backfill() {
+      return use().backfill;
+    },
   };
 
   const rewardLifecycleDeps = {
@@ -218,11 +267,20 @@ export function createLevelingModule(options: {
     get rules() {
       return use().rules;
     },
+    get audit() {
+      return use().audit;
+    },
   };
 
   const voiceDeps = {
     get voice() {
       return use().voice;
+    },
+  };
+
+  const reactionDeps = {
+    get reactions() {
+      return use().reactions;
     },
   };
 
@@ -244,9 +302,13 @@ export function createLevelingModule(options: {
     createLeaderboardCommand(boardDeps),
     createLevelCommand(levelDeps),
     createXpCommand(xpDeps),
+    createCardCommand(cardDeps),
   ];
 
-  const components: ComponentHandler[] = [createLeaderboardComponent(boardDeps)];
+  const components: ComponentHandler[] = [
+    createLeaderboardComponent(boardDeps),
+    createBackfillComponent(backfillDeps),
+  ];
   const listeners: ListenerDefinition[] = [
     createMessageXpListener(messageDeps),
     // Reward roles are reconciled, never incrementally granted (ADR-007), so
@@ -256,11 +318,25 @@ export function createLevelingModule(options: {
     createMemberLeaveListener(rewardLifecycleDeps),
     createRoleDeleteListener(rewardLifecycleDeps),
     createVoiceStateListener(voiceDeps),
+    createReactionListener(reactionDeps),
   ];
+
+  const highlightsDeps = {
+    get db() {
+      return use().db;
+    },
+    get configs() {
+      return use().configs;
+    },
+    get boards() {
+      return use().boards;
+    },
+  };
 
   const jobs: JobDefinition[] = [
     createRewardHealthJob(rewardLifecycleDeps),
     createVoiceTickJob(voiceDeps),
+    createHighlightsJob(highlightsDeps),
   ];
 
   if (options.retention) jobs.push(createRetentionJob(options.retention));
@@ -334,7 +410,21 @@ function build(ctx: ModuleContext, metrics: MetricsSink): LevelingServices {
   const voiceSessions = createVoiceSessionRepository(db);
   const voice = createVoiceService({ sessions: voiceSessions, configs, awarder, log });
 
+  const cards = createCardConfigRepository(db);
+  const renderer = createCanvasCardRenderer({ log });
+
+  const reactions = createReactionService({
+    awards: createReactionAwardRepository(db),
+    configs,
+    awarder,
+    log,
+  });
+
   const reconciler = createRewardReconciler({ client, rules, log });
+
+  const backfill = createRewardBackfill({ db, configs, memberXp, reconciler, log });
+  const importer = createXpImporter({ db, memberXp, log });
+
   const notifier = createLevelUpNotifier({
     client,
     log,
@@ -399,6 +489,11 @@ function build(ctx: ModuleContext, metrics: MetricsSink): LevelingServices {
     notifier,
     cooldowns,
     voice,
+    reactions,
+    cards,
+    renderer,
+    backfill,
+    importer,
     stopSweeping: () => cooldowns.stopSweeping(),
   };
 }

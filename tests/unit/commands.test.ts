@@ -32,8 +32,9 @@ function walk(options: OptionLike[] | undefined, visit: (o: OptionLike) => void)
 }
 
 describe('the leveling module’s command surface', () => {
-  it('registers the four commands a usable bot needs', () => {
+  it('registers the commands a usable bot needs', () => {
     expect(commands.map((c) => c.name).sort()).toEqual([
+      'card',
       'leaderboard',
       'level',
       'rank',
@@ -70,6 +71,36 @@ describe('the leveling module’s command surface', () => {
     }
   });
 
+  /**
+   * Discord's least-known limit, and the one this bot is heading towards.
+   *
+   * A command's names, descriptions and choice values must total under 8,000
+   * characters ACROSS its whole tree. `/level` alone is a third of the way
+   * there after M15, and the failure is a 400 at boot with a message that
+   * points at a JSON path rather than at the subcommand that tipped it over.
+   */
+  it('keeps each command under Discord’s 8,000-character total', () => {
+    interface Sizeable {
+      name?: string | undefined;
+      description?: string | undefined;
+      options?: Sizeable[] | undefined;
+      choices?: { name: string; value: string | number }[] | undefined;
+    }
+
+    const size = (node: Sizeable): number => {
+      let total = (node.name?.length ?? 0) + (node.description?.length ?? 0);
+      for (const option of node.options ?? []) total += size(option);
+      for (const choice of node.choices ?? []) {
+        total += choice.name.length + String(choice.value).length;
+      }
+      return total;
+    };
+
+    for (const command of commands) {
+      expect(size(command.data as Sizeable), command.name).toBeLessThan(8_000);
+    }
+  });
+
   it('never exceeds 25 options at any one level', () => {
     for (const command of commands) {
       const top = (command.data as { options?: OptionLike[] }).options ?? [];
@@ -90,19 +121,27 @@ describe('the leveling module’s command surface', () => {
     expect(level?.autocomplete).toBeTypeOf('function');
   });
 
-  it('defers every command, because all four touch the database', () => {
+  it('defers every command, because they all touch the database', () => {
     for (const command of commands) {
       expect(command.defer, command.name).toBe(true);
     }
   });
 
   it('answers admin commands ephemerally and member commands in channel', () => {
+    // `/card` joins the admin commands here for a different reason: it is a
+    // member's own settings, and a preview of your own card does not belong in
+    // everyone else's chat. `/rank` and `/leaderboard` stay public because the
+    // whole point of them is being seen.
     const ephemeral = commands.filter((c) => c.ephemeral).map((c) => c.name);
-    expect(ephemeral.sort()).toEqual(['level', 'xp']);
+    expect(ephemeral.sort()).toEqual(['card', 'level', 'xp']);
   });
 
-  it('claims exactly one component prefix', () => {
-    expect((module_.components ?? []).map((c) => c.customIdPrefix)).toEqual(['lb']);
+  it('claims a distinct component prefix per interactive surface', () => {
+    // Prefixes are how the dispatcher routes a button press, so two handlers
+    // sharing one would mean the second is unreachable — silently.
+    const prefixes = (module_.components ?? []).map((c) => c.customIdPrefix);
+    expect(prefixes.sort()).toEqual(['lb', 'rwbf']);
+    expect(new Set(prefixes).size).toBe(prefixes.length);
   });
 
   it('requests MessageContent only when asked', () => {

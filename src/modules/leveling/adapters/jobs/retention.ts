@@ -25,6 +25,12 @@ export interface RetentionOptions {
   readonly auditDays: number;
   readonly voiceSessionDays: number;
   readonly periodXpDays: number;
+  /**
+   * Reaction dedup records. LONG by default and deliberately so: this table IS
+   * the anti-farming guarantee, and deleting a row re-opens the "remove and
+   * re-react" loop for that message. A year means a farm has to wait a year.
+   */
+  readonly reactionAwardDays?: number;
   /** Rows per statement. Bounded so no single delete holds long locks. */
   readonly batchSize?: number;
 }
@@ -60,6 +66,30 @@ export function createRetentionJob(options: RetentionOptions): JobDefinition {
           options.voiceSessionDays,
           batchSize,
         ),
+        reactionAwards: await purge(
+          ctx,
+          `DELETE FROM reaction_award WHERE ctid IN (
+             SELECT ctid FROM reaction_award
+             WHERE awarded_at < now() - make_interval(days => $1)
+             LIMIT $2)`,
+          options.reactionAwardDays ?? 365,
+          batchSize,
+        ),
+        // Expired boosters are already INERT — the resolver checks expiry at
+        // read time, so this is tidiness rather than correctness. Left alone
+        // they accumulate in `/level restrict list` until an admin cannot see
+        // the rules that still matter.
+        expiredBoosters: await purge(
+          ctx,
+          `DELETE FROM xp_rule WHERE id IN (
+             SELECT id FROM xp_rule
+             WHERE kind = 'boost'
+               AND expires_at IS NOT NULL
+               AND expires_at < now() - make_interval(days => $1)
+             LIMIT $2)`,
+          1,
+          batchSize,
+        ),
         periodXp: await purge(
           ctx,
           `DELETE FROM member_period_xp
@@ -73,7 +103,12 @@ export function createRetentionJob(options: RetentionOptions): JobDefinition {
         ),
       };
 
-      const total = deleted.audit + deleted.voiceSessions + deleted.periodXp;
+      const total =
+        deleted.audit +
+        deleted.voiceSessions +
+        deleted.periodXp +
+        deleted.reactionAwards +
+        deleted.expiredBoosters;
       if (total > 0) ctx.log.info(deleted, 'retention removed expired operational rows');
     },
   };

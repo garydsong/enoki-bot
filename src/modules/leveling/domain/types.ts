@@ -42,6 +42,10 @@ export interface SourceConfig {
   readonly cooldownSeconds: number;
   readonly perEventCap: number;
   readonly messageMode?: 'random' | 'per_word';
+  /** reaction_receive only: distinct reactors credited per message. */
+  readonly reactionMaxPerMessage?: number;
+  /** Reactions on a message older than this earn nothing. Null = no limit. */
+  readonly reactionMaxMessageAgeDays?: number | null;
 }
 
 export type RuleKind = 'restrict_deny' | 'restrict_only' | 'boost';
@@ -115,6 +119,25 @@ export interface NotificationConfig {
   readonly onlyOnRewardLevels: boolean;
 }
 
+export interface HighlightsConfig {
+  readonly enabled: boolean;
+  readonly channelId: Snowflake | null;
+  readonly weekly: boolean;
+  readonly monthly: boolean;
+  readonly size: number;
+  readonly firstPlaceRoleId: Snowflake | null;
+  /** Beyond this, a finished period is marked done without posting. */
+  readonly graceHours: number;
+}
+
+export interface CardsConfig {
+  readonly enabled: boolean;
+  /** 0xRRGGBB. The server's house accent. */
+  readonly accentColor: number;
+  readonly backgroundUrl: string | null;
+  readonly allowMemberCustomisation: boolean;
+}
+
 export interface GuildLevelingConfig {
   readonly enabled: boolean;
   readonly curve: CurveConfig;
@@ -122,6 +145,8 @@ export interface GuildLevelingConfig {
   readonly rules: readonly XpRule[];
   readonly rewards: readonly RoleRewardRule[];
   readonly notifications: NotificationConfig;
+  readonly highlights: HighlightsConfig;
+  readonly cards: CardsConfig;
   readonly rewardStacking: StackingMode;
   readonly removeOnLevelDown: boolean;
   readonly boosterStacking: StackingMode;
@@ -141,6 +166,13 @@ export interface GuildLevelingConfig {
   readonly manualGrantMax: number;
   /** When true, `/xp reset` refuses — a deliberate one-way door for a live server. */
   readonly disableResets: boolean;
+  /**
+   * Delete a member's leveling data when they LEAVE, rather than keeping it for
+   * a rejoin (ADR-014's opt-out). Off by default because the surprising
+   * behaviour is the destructive one: a member who leaves by accident and comes
+   * back expects their level to still be there.
+   */
+  readonly autoResetOnLeave: boolean;
   /** Reconcile reward roles opportunistically when a member runs `/rank`. */
   readonly reconcileOnRankCommand: boolean;
 }

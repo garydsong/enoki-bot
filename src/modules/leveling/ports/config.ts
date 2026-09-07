@@ -40,7 +40,11 @@ export interface ConfigRepository {
 }
 
 export interface RewardListEntry {
+  readonly type: 'exact' | 'recurring';
+  /** The level for an exact rule; the FIRST qualifying level for a recurring one. */
   readonly level: number;
+  /** Recurring only: the step between iterations. */
+  readonly everyN: number | null;
   readonly roleId: string;
   readonly brokenReason: string | null;
 }
@@ -73,7 +77,24 @@ export interface RuleRepository {
     roleId: string,
     createdBy?: string | null,
   ): Promise<void>;
+  /**
+   * "Grant this role at `startLevel`, and again every `everyN` levels."
+   *
+   * The same role each time, so the member simply holds it from `startLevel`
+   * onwards — the step only decides where the rule ranks under `highest`
+   * stacking. Kept separate from `addReward` because the two rule shapes have
+   * different unique indexes and neither can be expressed as the other.
+   */
+  addRecurringReward(
+    guildId: string,
+    everyN: number,
+    startLevel: number,
+    roleId: string,
+    createdBy?: string | null,
+  ): Promise<void>;
   removeReward(guildId: string, level: number, roleId?: string): Promise<number>;
+  /** Remove recurring rules for a role (all of them when `roleId` is omitted). */
+  removeRecurringReward(guildId: string, roleId?: string): Promise<number>;
   listRewards(guildId: string): Promise<RewardListEntry[]>;
   /** Record a breakage. Notification is throttled — see BreakageRecord. */
   markRewardBroken(
@@ -95,11 +116,33 @@ export interface AuditEntry {
   readonly before?: unknown;
   readonly after?: unknown;
   readonly reason?: string | null;
+  /** Set on reads; ignored on writes, where the database supplies it. */
+  readonly createdAt?: Date | null;
+}
+
+/**
+ * What to look for in the audit log.
+ *
+ * The filters exist because the log is only useful once it is long. "Who has
+ * been giving XP to this one member?" is the question an admin actually asks,
+ * and answering it by paging through everything is not answering it.
+ */
+export interface AuditQuery {
+  /** The member the entry is ABOUT. */
+  readonly targetUserId?: string | null;
+  /** Who performed it. */
+  readonly actorId?: string | null;
+  /** Exact action, or a `prefix.` — `xp.` matches `xp.add`, `xp.set`, … */
+  readonly action?: string | null;
+  readonly limit?: number;
 }
 
 export interface AuditRepository {
   record(guildId: string, entry: AuditEntry, tx?: Queryable): Promise<void>;
   recent(guildId: string, limit?: number): Promise<AuditEntry[]>;
+  search(guildId: string, query: AuditQuery): Promise<AuditEntry[]>;
+  /** Distinct action names seen in this guild, for autocomplete. */
+  actions(guildId: string): Promise<string[]>;
 }
 
 /**

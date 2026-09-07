@@ -78,6 +78,8 @@ const EnvSchema = z.object({
   RETENTION_AUDIT_DAYS: z.coerce.number().int().min(1).max(3650).default(90),
   RETENTION_VOICE_SESSION_DAYS: z.coerce.number().int().min(1).max(3650).default(30),
   RETENTION_PERIOD_XP_DAYS: z.coerce.number().int().min(30).max(3650).default(400),
+  // Long by design: this table is the anti-farming guarantee for reactions.
+  RETENTION_REACTION_AWARD_DAYS: z.coerce.number().int().min(30).max(3650).default(365),
 });
 
 export type Env = z.infer<typeof EnvSchema>;

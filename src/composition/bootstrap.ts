@@ -92,6 +92,7 @@ export async function boot(env: Env, log: Logger): Promise<BootResult> {
         auditDays: env.RETENTION_AUDIT_DAYS,
         voiceSessionDays: env.RETENTION_VOICE_SESSION_DAYS,
         periodXpDays: env.RETENTION_PERIOD_XP_DAYS,
+        reactionAwardDays: env.RETENTION_REACTION_AWARD_DAYS,
       },
     }),
   );

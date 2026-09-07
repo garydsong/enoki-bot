@@ -23,14 +23,21 @@ Built to a written specification — see **`docs/spec/`** (also in the Claude pr
 | **M8 — Debugging & observability** | ✅ done |
 | **M9 — Voice XP** | ✅ done |
 | **M10 — Production hardening** | ✅ **v1.0** |
-| M11–M15 (reactions, boosters, periodic boards, cards, admin depth) | not started |
+| **M11 — Reaction XP** | ✅ done |
+| **M12 — Boosters end to end** | ✅ done |
+| **M13 — Periodic boards & Highlights** | ✅ done |
+| **M14 — Rank cards** | ✅ done |
+| **M15 — Admin depth** | ✅ done — **the roadmap is complete** |
 
-**578 tests green** — 391 unit, 178 integration (real Postgres), 9 architecture.
+**697 tests green** — unit, integration (real Postgres) and architecture.
 
-This is v1.0: message, voice and manual XP; levels; level-up messages; role
-rewards; rank and leaderboards; full configuration; debugging tools. Documented,
-backed up, restorable, and survivable across restarts and dependency outages.
-See **`docs/RUNBOOK.md`** to operate it.
+Every milestone in `docs/spec/10-implementation-roadmap.md` is implemented:
+message, voice, reaction and manual XP; levels; level-up messages; role rewards
+including recurring rules and a backfill; rank and leaderboards including
+weekly, monthly and automatic Highlights; rank card images; XP import from
+another bot; full configuration; debugging tools; and a member's right to have
+their data deleted. Documented, backed up, restorable, and survivable across
+restarts and dependency outages. See **`docs/RUNBOOK.md`** to operate it.
 
 ```bash
 npm install
@@ -50,7 +57,7 @@ file, so `DATABASE_URL=... npm run dev` overrides it.
 npm run dev
 ```
 
-Expect: migrations applied, four commands registered, gateway ready, Enoki
+Expect: migrations applied, five commands registered, gateway ready, Enoki
 online in your server.
 
 Then, in Discord:
@@ -168,12 +175,45 @@ Send a message, wait a minute, send another, and run `/rank`.
   in voice; retention removes only operational data, never XP; and the restore
   drill in the runbook was actually performed rather than merely written.
 
+**Reactions, boosters, periodic boards, cards and admin depth (M11–M15).**
+
+- **Reaction XP** — the only source with *durable* idempotency (ADR-010),
+  because removing a reaction and adding it back is a two-click loop anyone can
+  run forever; an in-memory window would set the price of farming at "wait ten
+  minutes". One award per (message, reactor, emoji), for good.
+- **Weekly and monthly boards, and Highlights** — a period "reset" is the clock
+  advancing, not a job (ADR-006). The Highlights poster claims a
+  (guild, period) row *before* posting, so it posts exactly once however often
+  the job runs or the process restarts, and a stale period is marked done
+  rather than announced a fortnight late.
+- **Rank cards** — a 900×260 PNG with member-level personalisation, an SSRF
+  allowlist that accepts only Discord's own CDN, and a render budget: if
+  anything at all goes wrong the command answers with the embed instead. A
+  member who asks for their rank always gets an answer.
+- **Reward backfill** — reconciliation is level-triggered, so a rule added to a
+  year-old server matches nobody until they next level up (and for a member at
+  max level, never). `/level reward backfill` walks every member, claims the
+  guild so two runs cannot overlap, paces itself against Discord's role budget,
+  reports progress, can be cancelled from anywhere — and **defaults to a dry
+  run**, using the same code path with the writes skipped.
+- **XP import** — a server leaving Arcane or MEE6 arrives with a CSV. The
+  parser is permissive about layout (headers or not, extra columns, BOM, CRLF,
+  semicolons, thousands separators) and unforgiving about values, because the
+  expensive failure is not "the import errored" but "the import read the wrong
+  column". Batches are transactions, so a bad row costs its batch and reports
+  exactly how far it got.
+- **Data deletion** — `/xp forget` is the one `/xp` subcommand a member can run
+  on themselves without Manage Server, because a deletion right that needs an
+  admin's cooperation is not a right. `admin.autoResetOnLeave` does the same on
+  departure, and audits the erasure without retaining what it erased.
+
 ## What does not exist yet
 
-Reaction XP (M11), boosters as a command surface (M12), weekly/monthly
-Highlights (M13), rank card images (M14) and reward backfill / XP import (M15).
-Boosters and periodic boards already work in the engine and the schema — what is
-missing is the last mile of command surface and scheduled posting.
+Everything on the roadmap is built. What remains is explicitly post-roadmap in
+`docs/spec/10-implementation-roadmap.md`: a web dashboard, a public leaderboard
+with vanity URLs, custom curve expressions, seasons and archiving, level-up
+graphics, DM notifications, and additional non-leveling modules — which is what
+the `BotModule` seam exists for.
 
 ---
 
@@ -264,9 +304,14 @@ tests/
 | `/level restrict add\|remove\|list` | Manage Server | No-XP and XP-only-here rules |
 | `/level boost add\|remove` | Manage Server | Bonus XP for a role or channel, optionally temporary |
 | `/level reward add\|remove\|list` | Manage Server | Roles granted at a level |
+| `/level reward add-recurring\|remove-recurring` | Manage Server | "…and again every N levels" |
+| `/level reward backfill [apply]` | Manage Server | Catch every member up. Dry run by default |
 | `/xp add\|remove\|set <user>` | Manage Server | Manual adjustment, audit-logged |
 | `/xp reset <user>` / `/xp reset-server` | Manage Server | Wipes, both explicitly confirmed |
-| `/xp audit` | Manage Server | Recent administrative changes |
+| `/xp import <file> [mode] [apply]` | Manage Server | CSV from another bot. Dry run by default |
+| `/xp forget [user]` | **everyone, for themselves** | Permanently delete leveling data |
+| `/xp audit [user] [actor] [action]` | Manage Server | Administrative changes, filterable |
+| `/card color\|background\|preview\|reset` | everyone | Personalise your rank card |
 | `/level debug why [user] [channel]` | Manage Server | Every gate a message would pass or fail |
 | `/level debug member [user]` | Manage Server | Everything stored about one member |
 | `/level debug rewards [user]` | Manage Server | Desired roles, the diff, and what is blocking |
