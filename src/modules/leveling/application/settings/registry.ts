@@ -1,5 +1,6 @@
 import { DateTime } from 'luxon';
 import { validateTemplate } from '../../domain/notifications/template.js';
+import { validateDiscordCdnUrl } from '../../domain/net/discordCdn.js';
 import type { GuildLevelingConfig, PassiveXpSource } from '../../domain/types.js';
 
 /**
@@ -361,6 +362,117 @@ const CONFIG_SETTINGS: readonly SettingDefinition[] = [
     read: (c) => yesNo(c.hideDepartedMembers),
   },
 
+  // --- highlights ----------------------------------------------------------
+  {
+    key: 'highlights.enabled',
+    column: 'highlights_enabled',
+    kind: 'boolean',
+    description: 'Post a summary of the top members when a week or month ends.',
+    read: (c) => yesNo(c.highlights.enabled),
+  },
+  {
+    key: 'highlights.channel',
+    column: 'highlights_channel_id',
+    kind: 'channel',
+    nullable: true,
+    description: 'Where the weekly/monthly summary is posted.',
+    read: (c) => (c.highlights.channelId ? `<#${c.highlights.channelId}>` : 'none'),
+  },
+  {
+    key: 'highlights.weekly',
+    column: 'highlights_weekly',
+    kind: 'boolean',
+    description: 'Post a summary at the end of each week.',
+    read: (c) => yesNo(c.highlights.weekly),
+  },
+  {
+    key: 'highlights.monthly',
+    column: 'highlights_monthly',
+    kind: 'boolean',
+    description: 'Post a summary at the end of each month.',
+    read: (c) => yesNo(c.highlights.monthly),
+  },
+  {
+    key: 'highlights.size',
+    column: 'highlights_size',
+    kind: 'integer',
+    min: 1,
+    max: 25,
+    description: 'How many members the summary lists.',
+    read: (c) => String(c.highlights.size),
+  },
+  {
+    key: 'highlights.firstPlaceRole',
+    column: 'first_place_role_id',
+    kind: 'string',
+    nullable: true,
+    description: 'Role given to whoever tops the weekly board. Accepts a role id.',
+    parse: (raw) => {
+      const trimmed = raw.trim().replace(/^<@&(\d+)>$/, '$1');
+      if (/^(none|off|clear|default|unset)$/i.test(trimmed)) return { ok: true, value: null };
+      if (!/^\d{17,20}$/.test(trimmed)) {
+        return { ok: false, error: 'must be a role mention or a role id, or `none`' };
+      }
+      return { ok: true, value: trimmed };
+    },
+    read: (c) =>
+      c.highlights.firstPlaceRoleId ? `<@&${c.highlights.firstPlaceRoleId}>` : 'none',
+  },
+  {
+    key: 'highlights.graceHours',
+    column: 'highlights_grace_hours',
+    kind: 'integer',
+    min: 1,
+    max: 720,
+    description: 'After this long, a finished period is skipped rather than announced late.',
+    read: (c) => `${c.highlights.graceHours}h`,
+  },
+
+  // --- rank cards ----------------------------------------------------------
+  {
+    key: 'cards.enabled',
+    column: 'cards_enabled',
+    kind: 'boolean',
+    description: 'Render /rank as an image instead of an embed.',
+    read: (c) => yesNo(c.cards.enabled),
+  },
+  {
+    key: 'cards.accent',
+    column: 'card_accent_color',
+    kind: 'string',
+    nullable: true,
+    description: 'The server’s card accent colour, as hex.',
+    parse: parseColor,
+    read: (c) => `#${c.cards.accentColor.toString(16).padStart(6, '0')}`,
+  },
+  {
+    key: 'cards.background',
+    column: 'card_background_url',
+    kind: 'string',
+    nullable: true,
+    description: 'Default card background. Must be an image hosted on Discord.',
+    parse: (raw) => {
+      const trimmed = raw.trim();
+      if (/^(none|off|clear|default|unset)$/i.test(trimmed)) return { ok: true, value: null };
+      const validated = validateDiscordCdnUrl(trimmed);
+      return validated.ok
+        ? { ok: true, value: validated.url }
+        : {
+            ok: false,
+            error:
+              'must be an image hosted on Discord (upload it to a channel and copy that link)',
+          };
+    },
+    read: (c) => c.cards.backgroundUrl ?? 'none',
+  },
+  {
+    key: 'cards.allowMemberCustomisation',
+    column: 'card_allow_member_customisation',
+    kind: 'boolean',
+    description: 'Let members override the card colour and background with /card.',
+    read: (c) => yesNo(c.cards.allowMemberCustomisation),
+  },
+
   // --- anti-abuse ----------------------------------------------------------
   {
     key: 'limits.minAccountAgeDays',
@@ -404,6 +516,15 @@ const CONFIG_SETTINGS: readonly SettingDefinition[] = [
     kind: 'boolean',
     description: 'Refuse /xp reset entirely. A deliberate safety catch.',
     read: (c) => yesNo(c.disableResets),
+  },
+  {
+    key: 'admin.autoResetOnLeave',
+    column: 'auto_reset_on_leave',
+    kind: 'boolean',
+    // The description says what it DELETES, because the setting's name sounds
+    // like a reset — reversible — and it is not.
+    description: 'DELETE a member’s XP, stats and history when they leave. No undo, no rejoin.',
+    read: (c) => yesNo(c.autoResetOnLeave),
   },
 
   // --- voice ---------------------------------------------------------------
@@ -503,6 +624,32 @@ function sourceSettings(source: PassiveXpSource): SettingDefinition[] {
       read: (c) => `${read(c).cooldownSeconds}s`,
     },
   ];
+
+  if (source === 'reaction_add' || source === 'reaction_receive') {
+    settings.push(
+      {
+        key: `${source}.maxPerMessage`,
+        column: 'reaction_max_per_message',
+        source,
+        kind: 'integer',
+        min: 1,
+        max: 100,
+        description: `Distinct reactors credited per message for ${label}.`,
+        read: (c) => String(read(c).reactionMaxPerMessage ?? 3),
+      },
+      {
+        key: `${source}.maxMessageAgeDays`,
+        column: 'reaction_max_message_age_days',
+        source,
+        kind: 'integer',
+        nullable: true,
+        min: 1,
+        max: 3650,
+        description: `Reactions on messages older than this earn nothing. \`none\` = no limit.`,
+        read: (c) => orNone(read(c).reactionMaxMessageAgeDays ?? null),
+      },
+    );
+  }
 
   if (source === 'message') {
     settings.push({

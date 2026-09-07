@@ -20,13 +20,26 @@ export const DEFAULT_LEVELING_CONFIG: GuildLevelingConfig = {
       messageMode: 'random',
     },
     voice: { enabled: false, minXp: 10, maxXp: 15, cooldownSeconds: 180, perEventCap: 500 },
-    reaction_add: { enabled: false, minXp: 20, maxXp: 25, cooldownSeconds: 300, perEventCap: 500 },
+    reaction_add: {
+      enabled: false,
+      minXp: 20,
+      maxXp: 25,
+      cooldownSeconds: 300,
+      perEventCap: 500,
+      reactionMaxPerMessage: 3,
+      reactionMaxMessageAgeDays: null,
+    },
     reaction_receive: {
       enabled: false,
       minXp: 20,
       maxXp: 25,
       cooldownSeconds: 300,
       perEventCap: 500,
+      // Three DISTINCT reactors credited per message. The cap is on the
+      // receiving side because that is the farmable one: a ring of alts
+      // reacting to one friend's message is the vector.
+      reactionMaxPerMessage: 3,
+      reactionMaxMessageAgeDays: null,
     },
   },
   rules: [],
@@ -39,6 +52,22 @@ export const DEFAULT_LEVELING_CONFIG: GuildLevelingConfig = {
     embedColor: null,
     deleteAfterSeconds: null,
     onlyOnRewardLevels: false,
+  },
+  highlights: {
+    enabled: false,
+    channelId: null,
+    weekly: true,
+    monthly: false,
+    size: 5,
+    firstPlaceRoleId: null,
+    graceHours: 48,
+  },
+  cards: {
+    enabled: false,
+    // Discord blurple, so an unconfigured card still looks deliberate.
+    accentColor: 0x5865f2,
+    backgroundUrl: null,
+    allowMemberCustomisation: true,
   },
   rewardStacking: 'stack',
   removeOnLevelDown: true,
@@ -73,5 +102,6 @@ export const DEFAULT_LEVELING_CONFIG: GuildLevelingConfig = {
   allowSelfReactions: false,
   manualGrantMax: 1_000_000,
   disableResets: false,
+  autoResetOnLeave: false,
   reconcileOnRankCommand: false,
 };

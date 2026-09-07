@@ -166,6 +166,68 @@ export function createMemberXpRepository(db: Database): MemberXpRepository {
       };
     },
 
+    /**
+     * Many members, one statement (roadmap M15, `/xp import`).
+     *
+     * `unnest` turns three parallel arrays into a virtual table, so a 500-row
+     * batch is ONE round trip rather than 500. Levels arrive precomputed
+     * because the curve is guild configuration, not a database function — the
+     * same reason `addXp` takes `levelFor`.
+     *
+     * `add` mode clamps at zero like every other path, and `set` truncates the
+     * level column in the same statement, so neither can leave level
+     * disagreeing with total_xp.
+     */
+    async bulkUpsertXp(tx, guildId, entries, mode, levelFor) {
+      if (entries.length === 0) return 0;
+
+      const ids = entries.map((e) => e.userId);
+      const amounts = entries.map((e) => Math.max(0, Math.trunc(e.xp)));
+
+      if (mode === 'set') {
+        const levels = amounts.map((xp) => levelFor(xp));
+        const result = await tx.query(
+          `INSERT INTO member_xp (guild_id, user_id, total_xp, level)
+           SELECT $1, v.user_id, v.xp, v.level
+           FROM (SELECT unnest($2::bigint[]) AS user_id,
+                        unnest($3::bigint[]) AS xp,
+                        unnest($4::int[])    AS level) AS v
+           ON CONFLICT (guild_id, user_id) DO UPDATE
+             SET total_xp = EXCLUDED.total_xp,
+                 level    = EXCLUDED.level,
+                 updated_at = now()`,
+          [guildId, ids, amounts, levels],
+        );
+        return result.rowCount ?? 0;
+      }
+
+      // `add` needs the resulting total before it can know the level, and the
+      // total depends on what is already stored. Two statements in the caller's
+      // transaction: add, then re-level exactly the rows just touched.
+      await tx.query(
+        `INSERT INTO member_xp (guild_id, user_id, total_xp, level)
+         SELECT $1, v.user_id, v.xp, 0
+         FROM (SELECT unnest($2::bigint[]) AS user_id, unnest($3::bigint[]) AS xp) AS v
+         ON CONFLICT (guild_id, user_id) DO UPDATE
+           SET total_xp = member_xp.total_xp + EXCLUDED.total_xp,
+               updated_at = now()`,
+        [guildId, ids, amounts],
+      );
+
+      const { rows } = await tx.query<{ user_id: string; total_xp: string }>(
+        `SELECT user_id, total_xp FROM member_xp
+         WHERE guild_id = $1 AND user_id = ANY($2::bigint[])`,
+        [guildId, ids],
+      );
+      await tx.query(
+        `UPDATE member_xp AS m SET level = v.level
+         FROM (SELECT unnest($2::bigint[]) AS user_id, unnest($3::int[]) AS level) AS v
+         WHERE m.guild_id = $1 AND m.user_id = v.user_id`,
+        [guildId, rows.map((r) => r.user_id), rows.map((r) => levelFor(Number(r.total_xp)))],
+      );
+      return rows.length;
+    },
+
     async get(guildId, userId) {
       const { rows } = await db.query<RawMemberXp>(
         `SELECT guild_id, user_id, total_xp, level, display_name, avatar_hash, is_departed, last_xp_at
@@ -174,6 +236,29 @@ export function createMemberXpRepository(db: Database): MemberXpRepository {
       );
       const row = rows[0];
       return row ? toRow(row) : null;
+    },
+
+    /**
+     * KEYSET pagination, not OFFSET (roadmap M15, the reward backfill).
+     *
+     * A backfill of a large guild walks every member while other sessions are
+     * still writing XP. `OFFSET n` re-scans and, worse, SHIFTS when a row is
+     * inserted or deleted mid-walk — members get visited twice or skipped
+     * entirely. Ordering by the immutable primary key and asking for "the next
+     * page after this id" is stable under concurrent writes.
+     */
+    async pageMembers(guildId, options) {
+      const { rows } = await db.query<RawMemberXp>(
+        `SELECT guild_id, user_id, total_xp, level, display_name, avatar_hash, is_departed, last_xp_at
+         FROM member_xp
+         WHERE guild_id = $1
+           AND ($2::bigint IS NULL OR user_id > $2::bigint)
+           AND ($3::boolean OR is_departed = false)
+         ORDER BY user_id ASC
+         LIMIT $4`,
+        [guildId, options.afterUserId ?? null, options.includeDeparted, options.limit],
+      );
+      return rows.map(toRow);
     },
 
     /**
@@ -240,6 +325,55 @@ export function createMemberXpRepository(db: Database): MemberXpRepository {
         [guildId],
       );
       return result.rowCount ?? 0;
+    },
+
+    /**
+     * ERASURE, as opposed to `reset` above (roadmap M15; MR-7).
+     *
+     * Every table keyed on (guild, member) is listed here explicitly rather
+     * than relying on a cascade, because there is no foreign key between them —
+     * they are keyed on the member, and the member is not a row we own. A table
+     * added later and not added here is a data-deletion promise quietly broken,
+     * which is why an integration test enumerates `information_schema` and
+     * fails when one appears.
+     *
+     * `reaction_award` is deliberately NOT deleted: its rows are the anti-farm
+     * dedup keys, and dropping them would let a departing member re-earn every
+     * reaction they ever gave by rejoining. They hold no XP, no name and no
+     * content — only "this message was already counted".
+     */
+    async forget(guildId, userId) {
+      return db.withTransaction(async (tx) => {
+        const { rows } = await tx.query<{ total_xp: string }>(
+          `SELECT total_xp FROM member_xp WHERE guild_id = $1 AND user_id = $2 FOR UPDATE`,
+          [guildId, userId],
+        );
+
+        const del = async (table: string): Promise<number> => {
+          const result = await tx.query(
+            `DELETE FROM ${table} WHERE guild_id = $1 AND user_id = $2`,
+            [guildId, userId],
+          );
+          return result.rowCount ?? 0;
+        };
+
+        // Voice first: an open session referencing a member we are about to
+        // erase would be credited by the next tick and recreate the row.
+        const voiceRows = await del('voice_session');
+        const periodRows = await del('member_period_xp');
+        const cardRows = await del('member_card_config');
+        const statRows = await del('member_stats');
+        const xpRows = await del('member_xp');
+
+        return {
+          xpRows,
+          statRows,
+          periodRows,
+          cardRows,
+          voiceRows,
+          totalXpErased: Number(rows[0]?.total_xp ?? 0),
+        };
+      });
     },
 
     /**

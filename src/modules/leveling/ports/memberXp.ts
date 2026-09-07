@@ -48,6 +48,27 @@ export interface StatDelta {
 
 export type PeriodBucket = 'week' | 'month';
 
+export interface BulkXpEntry {
+  readonly userId: string;
+  readonly xp: number;
+}
+
+/**
+ * What a `forget` actually deleted.
+ *
+ * Per-table rather than a single total because "we deleted your data" is a
+ * claim, and a member exercising a deletion right deserves to see it itemised.
+ */
+export interface ForgetResult {
+  readonly xpRows: number;
+  readonly statRows: number;
+  readonly periodRows: number;
+  readonly cardRows: number;
+  readonly voiceRows: number;
+  /** The total XP that was erased, for the audit entry. */
+  readonly totalXpErased: number;
+}
+
 export interface MemberXpRepository {
   /**
    * Atomically add `delta` (which may be negative) and report before/after.
@@ -72,13 +93,46 @@ export interface MemberXpRepository {
     levelFor: (totalXp: number) => number,
   ): Promise<XpMutationResult>;
 
+  /**
+   * Write many members' totals in ONE round trip (backs `/xp import`).
+   *
+   * `mode: 'set'` replaces the total, `'add'` adds to it. Levels are computed
+   * by the caller and passed alongside, because the curve lives in guild
+   * configuration rather than in SQL.
+   *
+   * Takes a transaction handle rather than opening its own, so a caller can put
+   * a whole batch in one transaction and have a bad row roll the batch back.
+   */
+  bulkUpsertXp(
+    tx: Queryable,
+    guildId: string,
+    entries: readonly BulkXpEntry[],
+    mode: 'set' | 'add',
+    levelFor: (totalXp: number) => number,
+  ): Promise<number>;
+
   get(guildId: string, userId: string): Promise<MemberXpRow | null>;
+  /** Every member with a row, oldest id first, for keyset pagination. */
+  pageMembers(
+    guildId: string,
+    options: { readonly afterUserId?: string | null; readonly limit: number; readonly includeDeparted: boolean },
+  ): Promise<MemberXpRow[]>;
   /** Rank among members with XP. 1-based. Null when the member has no XP. */
   rankOf(guildId: string, userId: string): Promise<number | null>;
   countRanked(guildId: string): Promise<number>;
   markDeparted(guildId: string, userId: string, departed: boolean): Promise<void>;
   reset(guildId: string, userId: string): Promise<void>;
   resetGuild(guildId: string): Promise<number>;
+  /**
+   * ERASE a member: XP, statistics, period buckets, card settings and voice
+   * sessions, all of it, in one transaction. Backs `/xp forget` and
+   * `auto_reset_on_leave`.
+   *
+   * Distinct from `reset`, which zeroes the score and KEEPS the record. This is
+   * the deletion path, and it returns per-table counts so the caller can tell
+   * the member exactly what was removed rather than "done".
+   */
+  forget(guildId: string, userId: string): Promise<ForgetResult>;
   /** Recompute the denormalised level column after a curve change. */
   relevelGuild(guildId: string, levelFor: (totalXp: number) => number): Promise<number>;
 

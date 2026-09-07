@@ -198,6 +198,68 @@ not happen. If it does, `docker compose kill bot` is safe: open voice sessions
 are closed by the orphan sweep on the next start, at their last proven-present
 moment.
 
+### A reward backfill is stuck
+
+`/level reward backfill` claims its guild with a row in `job_run`
+(`job_name = 'leveling:reward_backfill'`, `scope_key` = the guild id) so two
+runs cannot overlap. Normal recovery is automatic: a claim left `running` for
+more than an hour is treated as abandoned by a dead process, and the next
+backfill takes it over.
+
+To stop a live run, press **Cancel** on its own message. That writes
+`status = 'cancelling'`, which the run re-reads at every member — so it works
+even if the run is executing in a different process from the one that received
+the click. If the message is gone:
+
+```sql
+UPDATE job_run SET status = 'cancelling'
+WHERE job_name = 'leveling:reward_backfill' AND scope_key = '<guild id>';
+```
+
+To release a claim immediately rather than waiting out the hour, set that row's
+status to `'failed'`. Reconciliation is idempotent, so re-running a backfill
+that stopped part-way costs API calls and changes nothing that is already
+correct.
+
+### An XP import went wrong
+
+Imports are applied in transactional batches of 500. If a batch fails, the
+reply says exactly how many rows were committed, and the failed batch changed
+nothing — there is no half-written batch to clean up.
+
+- **Wrong column was read.** Re-run with the correct file in `mode: set`; it is
+  idempotent, so the second import simply overwrites the first.
+- **Imported into the wrong server.** `/xp reset-server` (which requires typing
+  the server name) returns everyone to zero. Reward roles are not removed
+  automatically — follow with `/level reward backfill apply:True`.
+- **Nothing was imported and the reply mentions the file.** Attachments are
+  fetched only from Discord's own CDN. Upload the file with the `file` option
+  rather than pasting a link to it.
+
+Imports do not grant reward roles: run `/level reward backfill` afterwards,
+preview first.
+
+### A member asks for their data to be deleted
+
+`/xp forget` — they can run it on themselves without any permission. It removes
+XP, level, statistics, weekly and monthly history, card settings and voice
+sessions in one transaction, and records the deletion (their id and the total
+erased, nothing else) in the audit log.
+
+Two things it deliberately does not do, and are worth being able to explain:
+
+- **Reward roles stay.** The bot does not know which of a member's roles they
+  would want removed, and stripping roles nobody asked about is worse than
+  leaving them. Remove them by hand if asked.
+- **Reaction dedup keys stay.** Those rows hold no name, no content and no XP —
+  only "this message was already counted". Deleting them would let anyone erase
+  their data and immediately re-earn every reaction they had ever given.
+
+A server can make this automatic on departure with
+`/level config set admin.autoResetOnLeave on`. It is off by default: a member
+who leaves by accident and comes straight back expects their level to still be
+there.
+
 ---
 
 ## 7. What is kept, and for how long
@@ -216,6 +278,10 @@ Deletion runs daily in bounded batches so it never holds long locks on
 
 Removing the bot from a server does **not** delete anything — the guild is
 soft-deleted so a rejoin restores everything.
+
+The two paths that genuinely delete member data are `/xp forget` and
+`admin.autoResetOnLeave`; both are described in §6 and both leave an audit
+entry behind.
 
 ---
 

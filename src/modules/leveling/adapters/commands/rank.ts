@@ -1,4 +1,5 @@
 import {
+  AttachmentBuilder,
   EmbedBuilder,
   MessageFlags,
   SlashCommandBuilder,
@@ -9,9 +10,12 @@ import type { CommandDefinition } from '../../../../platform/plugin/types.js';
 import type { Database } from '../../../../platform/db/pool.js';
 import { getRankSnapshot } from '../../application/queries/leaderboard.js';
 import { desiredRewardRoles, upcomingRewards } from '../../domain/rewards/resolver.js';
+import { NEUTRAL_BPS, resolveMultiplier } from '../../domain/boosters/resolver.js';
 import type { GuildLevelingConfig } from '../../domain/types.js';
 import type { ConfigCache } from '../../ports/config.js';
 import type { RewardReconciler } from '../effects/rewardReconciler.js';
+import type { CardConfigRepository, CardRenderer } from '../../ports/cards.js';
+import { resolveStyle } from './card.js';
 import { escapeMarkdown, formatNumber, ordinal, progressBar } from './format.js';
 
 /**
@@ -25,6 +29,8 @@ export interface RankCommandDeps {
   readonly db: Database;
   readonly configs: ConfigCache;
   readonly reconciler: RewardReconciler;
+  readonly cards: CardConfigRepository;
+  readonly renderer: CardRenderer;
 }
 
 export function createRankCommand(deps: RankCommandDeps): CommandDefinition {
@@ -47,6 +53,7 @@ export function createRankCommand(deps: RankCommandDeps): CommandDefinition {
           .addChoices(
             { name: 'Progress (default)', value: 'progress' },
             { name: 'Reward roles', value: 'rewards' },
+            { name: 'Active XP boosters', value: 'boosters' },
           ),
       )
       .setDMPermission(false)
@@ -96,11 +103,52 @@ export function createRankCommand(deps: RankCommandDeps): CommandDefinition {
       const member = await interaction.guild?.members.fetch(target.id).catch(() => null);
       const displayName = member?.displayName ?? snapshot.displayName ?? target.username;
 
-      if (interaction.options.getString('view') === 'rewards') {
+      const view = interaction.options.getString('view');
+
+      if (view === 'rewards') {
         await interaction.editReply({
           embeds: [rewardsEmbed(displayName, target, snapshot.level, config)],
         });
         return;
+      }
+
+      if (view === 'boosters') {
+        await interaction.editReply({
+          embeds: [
+            boostersEmbed(displayName, target, config, member ? [...member.roles.cache.keys()] : []),
+          ],
+        });
+        return;
+      }
+
+      // THE CARD IS AN ENHANCEMENT, NEVER A DEPENDENCY. The renderer returns
+      // null on a slow CDN, a missing font, or a budget overrun, and the embed
+      // below answers regardless — a member asking for their rank always gets
+      // one (spec `05` §3.1).
+      if (config.cards.enabled) {
+        const style = await resolveStyle(deps, interaction.guildId, target.id, config.cards);
+        const png = await deps.renderer.render(
+          {
+            displayName,
+            avatarUrl: target.displayAvatarURL({ extension: 'png', size: 256 }),
+            level: snapshot.level,
+            rank: snapshot.rank,
+            rankTotal: snapshot.rankTotal,
+            xpIntoLevel: snapshot.xpIntoLevel,
+            xpForNextLevel: snapshot.xpForNextLevel,
+            totalXp: snapshot.totalXp,
+            progressRatio: snapshot.progressRatio,
+            isMaxLevel: snapshot.isMaxLevel,
+          },
+          style,
+        );
+
+        if (png) {
+          await interaction.editReply({
+            files: [new AttachmentBuilder(png, { name: 'rank.png' })],
+          });
+          return;
+        }
       }
 
       const next = upcomingRewards(snapshot.level, config.rewards)[0];
@@ -200,6 +248,98 @@ function rewardsEmbed(
   }
 
   return embed;
+}
+
+/**
+ * `/rank view:boosters` — what multiplier this member is actually getting.
+ *
+ * Computed with `resolveMultiplier`, the SAME function the pipeline calls, so
+ * the arithmetic shown here and the XP actually awarded cannot disagree. A
+ * hand-written summary would drift the first time stacking mode changed, and a
+ * member being told they have +50% while receiving +25% is worse than showing
+ * nothing at all.
+ *
+ * Evaluated for MESSAGE XP with no channel, so it reports the member's
+ * role-and-server-wide multiplier; channel boosts are listed separately because
+ * whether they apply depends on where they type.
+ */
+function boostersEmbed(
+  displayName: string,
+  target: User,
+  config: GuildLevelingConfig,
+  roleIds: readonly string[],
+): EmbedBuilder {
+  const now = Date.now();
+  const result = resolveMultiplier(
+    config.rules,
+    { roleIds, userId: target.id, source: 'message', location: undefined, now },
+    config.boosterStacking,
+    config.maxMultiplierBps,
+  );
+
+  const embed = new EmbedBuilder()
+    .setAuthor({
+      name: escapeMarkdown(displayName),
+      iconURL: target.displayAvatarURL({ size: 128 }),
+    })
+    .setTitle(`XP multiplier: ${(result.multiplierBps / NEUTRAL_BPS).toFixed(2)}x`);
+
+  if (result.applicable.length === 0) {
+    embed.setDescription('No boosters apply to you right now — you earn the standard rate.');
+  } else {
+    embed.addFields({
+      name: `Applying now (${config.boosterStacking === 'stack' ? 'summed' : 'highest only'})`,
+      value: result.applicable
+        .map((b) => `${describeTarget(b.targetType, b.targetId)} — ${signed(b.bonusBps)}`)
+        .join('\n')
+        .slice(0, 1024),
+    });
+  }
+
+  // Channel and category boosts depend on WHERE they type, so they cannot be
+  // folded into the number above without lying about one place or the other.
+  const locational = config.rules.filter(
+    (r) =>
+      r.kind === 'boost' &&
+      (r.targetType === 'channel' || r.targetType === 'category') &&
+      (r.expiresAt == null || r.expiresAt > now),
+  );
+  if (locational.length > 0) {
+    embed.addFields({
+      name: 'Also active in specific channels',
+      value: locational
+        .map((r) => `<#${r.targetId ?? ''}> — ${signed(r.bonusBps ?? 0)}`)
+        .join('\n')
+        .slice(0, 1024),
+    });
+  }
+
+  if (result.clamped) {
+    embed.setFooter({
+      text: `Capped at this server's ceiling of ${(config.maxMultiplierBps / NEUTRAL_BPS).toFixed(2)}x.`,
+    });
+  }
+
+  return embed;
+}
+
+function signed(bonusBps: number): string {
+  return `${bonusBps >= 0 ? '+' : ''}${bonusBps / 100}%`;
+}
+
+function describeTarget(targetType: string, targetId: string | null): string {
+  switch (targetType) {
+    case 'role':
+      return `<@&${targetId ?? ''}>`;
+    case 'user':
+      return 'you specifically';
+    case 'guild':
+      return 'server-wide';
+    case 'source':
+      return `${targetId ?? 'a source'} XP`;
+    default:
+      return `<#${targetId ?? ''}>`;
+  }
 }
 
 /** Shared by `/rank` and `/leaderboard` when leveling is off. */

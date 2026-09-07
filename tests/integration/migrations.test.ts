@@ -130,11 +130,29 @@ describe.runIf(await postgresAvailable())('migrations', () => {
     expect(tables).toContain('beta_thing');
   });
 
-  it('tolerates a module declaring a migrations dir that does not exist yet', async () => {
+  it('REFUSES a declared migrations directory that does not exist', async () => {
+    // This test used to assert the opposite, and that tolerance is what hid a
+    // real bug: `tsc` does not copy .sql files, so a built image had no module
+    // migrations at all. The loader shrugged, applied the core schema, and the
+    // bot then failed every leveling query with "relation does not exist" —
+    // with nothing in the logs pointing at the cause.
+    //
+    // A declared-but-missing directory is a BUILD problem. Failing at boot is
+    // the cheap outcome.
     const { db } = await withDb();
+
     await expect(
       runMigrations(db, [CORE, '/nonexistent/module/migrations'], silentLogger),
-    ).resolves.toBeDefined();
+    ).rejects.toThrow(/migrations directory not found/);
+  });
+
+  it('still tolerates an EMPTY migrations directory', async () => {
+    // The genuine "this module owns no tables yet" case, which is why the
+    // check above is about existence rather than contents.
+    const { db } = await withDb();
+    const dir = await mkdtemp(join(tmpdir(), 'enoki-empty-'));
+
+    await expect(runMigrations(db, [CORE, dir], silentLogger)).resolves.toBeDefined();
   });
 });
 

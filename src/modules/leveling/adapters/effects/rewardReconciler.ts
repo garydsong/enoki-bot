@@ -1,8 +1,13 @@
 import { DiscordAPIError, PermissionFlagsBits, type Client, type GuildMember } from 'discord.js';
 import type { Logger } from '../../../../platform/logging/logger.js';
 import { computeRewardDiff, managedRewardRoles } from '../../domain/rewards/resolver.js';
-import type { GuildLevelingConfig, Snowflake } from '../../domain/types.js';
+import type { Snowflake } from '../../domain/types.js';
 import type { RuleRepository } from '../../ports/config.js';
+import type {
+  BrokenReason,
+  ReconcileResult,
+  RewardReconciler,
+} from '../../ports/rewards.js';
 
 /**
  * Reward role reconciliation — the Discord half of ADR-007.
@@ -24,19 +29,12 @@ import type { RuleRepository } from '../../ports/config.js';
  *    effect; a member who levelled up keeps their level even if the role fails.
  */
 
-export interface ReconcileResult {
-  readonly added: readonly Snowflake[];
-  readonly removed: readonly Snowflake[];
-  readonly broken: readonly { roleId: Snowflake; reason: BrokenReason }[];
-  readonly skipped?: 'no_rules' | 'no_permission';
-}
-
-export type BrokenReason =
-  | 'role_deleted'
-  | 'hierarchy'
-  | 'missing_permission'
-  | 'managed'
-  | 'unassignable';
+export type {
+  BrokenReason,
+  ReconcileOptions,
+  ReconcileResult,
+  RewardReconciler,
+} from '../../ports/rewards.js';
 
 export interface RewardReconcilerDeps {
   readonly client: Client;
@@ -44,20 +42,12 @@ export interface RewardReconcilerDeps {
   readonly log: Logger;
 }
 
-export interface RewardReconciler {
-  reconcile(
-    guildId: string,
-    userId: string,
-    level: number,
-    config: GuildLevelingConfig,
-  ): Promise<ReconcileResult>;
-}
-
 const EMPTY: ReconcileResult = { added: [], removed: [], broken: [] };
 
 export function createRewardReconciler(deps: RewardReconcilerDeps): RewardReconciler {
   return {
-    async reconcile(guildId, userId, level, config) {
+    async reconcile(guildId, userId, level, config, options) {
+      const dryRun = options?.dryRun ?? false;
       if (config.rewards.length === 0) return { ...EMPTY, skipped: 'no_rules' };
 
       const guild = deps.client.guilds.cache.get(guildId);
@@ -99,6 +89,13 @@ export function createRewardReconciler(deps: RewardReconcilerDeps): RewardReconc
 
       const added: Snowflake[] = [];
       const removed: Snowflake[] = [];
+
+      if (dryRun) {
+        // Report what WOULD change and stop. No role writes, and no breakage
+        // recorded either: a preview that alters configuration is not a
+        // preview, and the same breakage will be found by the real run.
+        return { added: grantable, removed: toRemove, broken };
+      }
 
       if (grantable.length > 0) {
         const ok = await apply(member, 'add', grantable, deps.log, broken);

@@ -22,6 +22,7 @@ const GUILD = '111111111111111111';
 const ACTOR = '999999999999999999';
 const ROLE = '444444444444444444';
 const CHANNEL = '555555555555555555';
+const ROLE_ID = '666666666666666666';
 
 let temp: TempDatabase | null = null;
 afterEach(async () => {
@@ -78,7 +79,11 @@ describe.runIf(await postgresAvailable())('the setting registry against the real
     for (const setting of SETTINGS) {
       const sample = sampleFor(setting.kind, setting);
       const parsed = parseSettingValue(setting, sample);
-      expect(parsed.ok, `${setting.key} could not parse its own sample "${sample}"`).toBe(true);
+      expect(
+        parsed.ok,
+        `${setting.key} could not parse its own sample "${sample}" — ` +
+          'if this setting has a custom parser, add a valid sample for it to STRING_SAMPLES below',
+      ).toBe(true);
       if (!parsed.ok) continue;
 
       if (setting.source) {
@@ -98,9 +103,33 @@ function setting_table(source: string | undefined): string {
   return source ? 'xp_source_config' : 'leveling_config';
 }
 
+/**
+ * A valid sample for the string settings that carry their own parser.
+ *
+ * Kept as an explicit map rather than a chain of `if`s because this fixture has
+ * drifted behind the registry twice now: every new parsed string setting has to
+ * appear here, and the loop below says so by name when one does not.
+ */
+const STRING_SAMPLES: Record<string, string> = {
+  'levelup.template': 'GG {user.mention}, you reached level {level}!',
+  'periods.timezone': 'America/New_York',
+  'levelup.color': '#5865F2',
+  'highlights.firstPlaceRole': ROLE_ID,
+  'cards.accent': '#5865F2',
+  // `none` is the sanctioned "clear it" value — the only string a background
+  // can be that is not a Discord CDN URL.
+  'cards.background': 'none',
+};
+
 function sampleFor(
   kind: string,
-  setting: { key: string; min?: number; max?: number; choices?: readonly string[] },
+  setting: {
+    key: string;
+    min?: number;
+    max?: number;
+    choices?: readonly string[];
+    parse?: unknown;
+  },
 ): string {
   switch (kind) {
     case 'boolean':
@@ -115,10 +144,8 @@ function sampleFor(
       return '1.5';
     case 'string':
     default:
-      // The two string settings with their own parsers need their own shapes.
-      if (setting.key === 'periods.timezone') return 'America/New_York';
-      if (setting.key === 'levelup.color') return '#5865F2';
-      return 'hello {user.mention}';
+      // A plain string setting takes any text; a parsed one needs its own shape.
+      return setting.parse ? (STRING_SAMPLES[setting.key] ?? '') : 'hello {user.mention}';
   }
 }
 
@@ -275,7 +302,9 @@ describe.runIf(await postgresAvailable())('rules and rewards', () => {
     expect((await config.load(GUILD)).config.rewards).toHaveLength(0);
     // ...but still listed, with the reason, so it can be fixed.
     const listed = await rules.listRewards(GUILD);
-    expect(listed).toEqual([{ level: 5, roleId: ROLE, brokenReason: 'hierarchy' }]);
+    expect(listed).toEqual([
+      { type: 'exact', level: 5, everyN: null, roleId: ROLE, brokenReason: 'hierarchy' },
+    ]);
   });
 
   it('un-breaks a reward when the admin re-adds it', async () => {
@@ -297,6 +326,79 @@ describe.runIf(await postgresAvailable())('rules and rewards', () => {
 
     expect(await rules.removeReward(GUILD, 5)).toBe(2);
     expect(await rules.listRewards(GUILD)).toHaveLength(0);
+  });
+
+  // --- recurring rules (roadmap M15) ---------------------------------------
+
+  it('stores a recurring rule and assembles it back into the engine’s shape', async () => {
+    const { config, rules } = await setup();
+    await config.ensure(GUILD);
+
+    await rules.addRecurringReward(GUILD, 10, 5, ROLE, ACTOR);
+
+    expect((await config.load(GUILD)).config.rewards).toEqual([
+      { type: 'recurring', everyN: 10, startLevel: 5, roleId: ROLE },
+    ]);
+  });
+
+  it('lists a recurring rule as its first level plus its step', async () => {
+    const { config, rules } = await setup();
+    await config.ensure(GUILD);
+    await rules.addRecurringReward(GUILD, 10, 5, ROLE);
+
+    expect(await rules.listRewards(GUILD)).toEqual([
+      { type: 'recurring', level: 5, everyN: 10, roleId: ROLE, brokenReason: null },
+    ]);
+  });
+
+  it('keeps an exact rule and a recurring one for the SAME role apart', async () => {
+    // Different unique indexes, and a CHECK constraint that refuses to let one
+    // shape masquerade as the other. Adding both must produce two rules, not a
+    // conflict that silently updates the first.
+    const { config, rules } = await setup();
+    await config.ensure(GUILD);
+
+    await rules.addReward(GUILD, 5, ROLE);
+    await rules.addRecurringReward(GUILD, 10, 5, ROLE);
+
+    expect(await rules.listRewards(GUILD)).toHaveLength(2);
+  });
+
+  it('does not remove a recurring rule via the exact-level path', async () => {
+    // A recurring rule stores NULL in `level`, so `removeReward(guild, 5)`
+    // cannot match it — which is why there is a separate remover. If this ever
+    // changed, `/level reward remove level:5` would silently delete a rule the
+    // admin was not looking at.
+    const { config, rules } = await setup();
+    await config.ensure(GUILD);
+    await rules.addRecurringReward(GUILD, 10, 5, ROLE);
+
+    expect(await rules.removeReward(GUILD, 5)).toBe(0);
+    expect(await rules.removeRecurringReward(GUILD, ROLE)).toBe(1);
+    expect(await rules.listRewards(GUILD)).toHaveLength(0);
+  });
+
+  it('re-adding a recurring rule clears its breakage', async () => {
+    const { config, rules } = await setup();
+    await config.ensure(GUILD);
+    await rules.addRecurringReward(GUILD, 10, 5, ROLE);
+    await rules.markRewardBroken(GUILD, ROLE, 'hierarchy');
+
+    await rules.addRecurringReward(GUILD, 10, 5, ROLE);
+
+    expect((await rules.listRewards(GUILD))[0]?.brokenReason).toBeNull();
+  });
+
+  it('removes every recurring rule when no role is named', async () => {
+    const { config, rules } = await setup();
+    await config.ensure(GUILD);
+    await rules.addRecurringReward(GUILD, 10, 5, ROLE);
+    await rules.addRecurringReward(GUILD, 25, 25, '888888888888888888');
+    await rules.addReward(GUILD, 3, '777777777777777777');
+
+    expect(await rules.removeRecurringReward(GUILD)).toBe(2);
+    // The exact rule is untouched.
+    expect(await rules.listRewards(GUILD)).toHaveLength(1);
   });
 });
 
@@ -361,5 +463,89 @@ describe.runIf(await postgresAvailable())('the audit log', () => {
     const setting = findSetting('curve.type');
     await audit.record(GUILD, { action: `config.set:${setting?.key ?? ''}` });
     expect((await audit.recent(GUILD))[0]?.action).toBe('config.set:curve.type');
+  });
+
+  // --- querying (roadmap M15) ----------------------------------------------
+
+  async function seedAudit(audit: Awaited<ReturnType<typeof setup>>['audit']): Promise<void> {
+    await audit.record(GUILD, { actorId: ACTOR, action: 'xp.add', targetUserId: '1' });
+    await audit.record(GUILD, { actorId: ACTOR, action: 'xp.remove', targetUserId: '2' });
+    await audit.record(GUILD, { actorId: '777777777777777777', action: 'reward.add' });
+    await audit.record(GUILD, { actorId: null, action: 'xp.auto_reset_on_leave', targetUserId: '1' });
+  }
+
+  it('filters by the member an entry is ABOUT', async () => {
+    const { audit } = await setup();
+    await seedAudit(audit);
+
+    const entries = await audit.search(GUILD, { targetUserId: '1' });
+    expect(entries.map((e) => e.action)).toEqual(['xp.auto_reset_on_leave', 'xp.add']);
+  });
+
+  it('filters by who did it', async () => {
+    const { audit } = await setup();
+    await seedAudit(audit);
+
+    const entries = await audit.search(GUILD, { actorId: '777777777777777777' });
+    expect(entries.map((e) => e.action)).toEqual(['reward.add']);
+  });
+
+  it('matches a trailing dot as a PREFIX, because that is how admins ask', async () => {
+    // "Show me everything anyone did to member XP" is one question, not six
+    // action names.
+    const { audit } = await setup();
+    await seedAudit(audit);
+
+    const entries = await audit.search(GUILD, { action: 'xp.' });
+    expect(entries).toHaveLength(3);
+    expect(entries.every((e) => e.action.startsWith('xp.'))).toBe(true);
+  });
+
+  it('matches an action without a trailing dot EXACTLY', async () => {
+    const { audit } = await setup();
+    await seedAudit(audit);
+
+    expect(await audit.search(GUILD, { action: 'xp.add' })).toHaveLength(1);
+    // Not a prefix match: `xp` alone must not sweep in `xp.add`.
+    expect(await audit.search(GUILD, { action: 'xp' })).toHaveLength(0);
+  });
+
+  it('combines filters', async () => {
+    const { audit } = await setup();
+    await seedAudit(audit);
+
+    const entries = await audit.search(GUILD, { targetUserId: '1', action: 'xp.add' });
+    expect(entries).toHaveLength(1);
+  });
+
+  it('returns entries with their timestamps, newest first', async () => {
+    const { audit } = await setup();
+    await seedAudit(audit);
+
+    const entries = await audit.search(GUILD, {});
+    expect(entries[0]?.action).toBe('xp.auto_reset_on_leave');
+    expect(entries[0]?.createdAt).toBeInstanceOf(Date);
+  });
+
+  it('caps the limit rather than trusting it', async () => {
+    const { audit } = await setup();
+    await seedAudit(audit);
+
+    expect(await audit.search(GUILD, { limit: 2 })).toHaveLength(2);
+    // A caller asking for a million gets the ceiling, not a million rows.
+    expect((await audit.search(GUILD, { limit: 1_000_000 })).length).toBeLessThanOrEqual(100);
+  });
+
+  it('lists the distinct actions a guild has recorded', async () => {
+    const { audit } = await setup();
+    await seedAudit(audit);
+    await audit.record(GUILD, { action: 'xp.add' });
+
+    expect(await audit.actions(GUILD)).toEqual([
+      'reward.add',
+      'xp.add',
+      'xp.auto_reset_on_leave',
+      'xp.remove',
+    ]);
   });
 });

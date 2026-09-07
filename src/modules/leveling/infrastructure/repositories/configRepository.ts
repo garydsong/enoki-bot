@@ -49,6 +49,8 @@ interface RawSource {
   cooldown_seconds: number;
   per_event_cap: number;
   message_mode: 'random' | 'per_word' | null;
+  reaction_max_per_message: number | null;
+  reaction_max_message_age_days: number | null;
 }
 
 interface RawRule {
@@ -229,6 +231,8 @@ function assemble(
       cooldownSeconds: row.cooldown_seconds,
       perEventCap: row.per_event_cap,
       ...(row.message_mode ? { messageMode: row.message_mode } : {}),
+      reactionMaxPerMessage: row.reaction_max_per_message ?? 3,
+      reactionMaxMessageAgeDays: row.reaction_max_message_age_days,
     };
   };
 
@@ -300,6 +304,26 @@ function assemble(
       onlyOnRewardLevels: bool('levelup_only_on_reward_levels', false),
     },
 
+    highlights: {
+      enabled: bool('highlights_enabled', false),
+      channelId: asSnowflake(raw['highlights_channel_id']),
+      weekly: bool('highlights_weekly', true),
+      monthly: bool('highlights_monthly', false),
+      size: num('highlights_size', 5),
+      firstPlaceRoleId: asSnowflake(raw['first_place_role_id']),
+      graceHours: num('highlights_grace_hours', 48),
+    },
+
+    cards: {
+      enabled: bool('cards_enabled', false),
+      accentColor:
+        raw['card_accent_color'] == null ? 0x5865f2 : Number(raw['card_accent_color']),
+      backgroundUrl: typeof raw['card_background_url'] === 'string'
+        ? raw['card_background_url']
+        : null,
+      allowMemberCustomisation: bool('card_allow_member_customisation', true),
+    },
+
     rewardStacking: str('reward_stacking', 'stack'),
     removeOnLevelDown: bool('remove_on_level_down', true),
     boosterStacking: str('booster_stacking', 'stack'),
@@ -344,6 +368,7 @@ function assemble(
     allowSelfReactions: bool('allow_self_reactions', false),
     manualGrantMax: num('manual_grant_max', 1_000_000),
     disableResets: bool('disable_resets', false),
+    autoResetOnLeave: bool('auto_reset_on_leave', false),
     reconcileOnRankCommand: bool('reconcile_on_rank_command', false),
   };
 }
@@ -404,6 +429,41 @@ export function createRuleRepository(db: Database): RuleRepository {
       await bumpConfigVersion(db, guildId);
     },
 
+    /**
+     * "This role, at level N, and again every M levels."
+     *
+     * A separate statement from `addReward` because the two shapes have
+     * different unique indexes and a CHECK constraint that refuses to let one
+     * masquerade as the other (`role_reward_shape`). Re-adding an identical
+     * rule clears any breakage, matching the exact case: an admin re-adding a
+     * reward after fixing the role expects it to start working again.
+     */
+    async addRecurringReward(guildId, everyN, startLevel, roleId, createdBy) {
+      await db.query(
+        `INSERT INTO role_reward (guild_id, rule_type, every_n, start_level, role_id, created_by)
+         VALUES ($1, 'recurring', $2, $3, $4, $5)
+         ON CONFLICT (guild_id, every_n, start_level, role_id) WHERE rule_type = 'recurring'
+         DO UPDATE SET broken_reason = NULL, broken_notified_at = NULL`,
+        [guildId, everyN, startLevel, roleId, createdBy ?? null],
+      );
+      await bumpConfigVersion(db, guildId);
+    },
+
+    async removeRecurringReward(guildId, roleId) {
+      const result = roleId
+        ? await db.query(
+            `DELETE FROM role_reward
+             WHERE guild_id = $1 AND rule_type = 'recurring' AND role_id = $2`,
+            [guildId, roleId],
+          )
+        : await db.query(
+            `DELETE FROM role_reward WHERE guild_id = $1 AND rule_type = 'recurring'`,
+            [guildId],
+          );
+      await bumpConfigVersion(db, guildId);
+      return result.rowCount ?? 0;
+    },
+
     async removeReward(guildId, level, roleId) {
       const result = roleId
         ? await db.query(
@@ -420,16 +480,26 @@ export function createRuleRepository(db: Database): RuleRepository {
 
     async listRewards(guildId) {
       const { rows } = await db.query<{
+        rule_type: 'exact' | 'recurring';
         level: number | null;
+        every_n: number | null;
+        start_level: number | null;
         role_id: string;
         broken_reason: string | null;
       }>(
-        `SELECT level, role_id, broken_reason FROM role_reward
-         WHERE guild_id = $1 ORDER BY level NULLS LAST, role_id`,
+        // Ordered by the level the rule FIRST takes effect, so an exact rule at
+        // 10 and a recurring one starting at 10 sit next to each other rather
+        // than in two separate blocks.
+        `SELECT rule_type, level, every_n, start_level, role_id, broken_reason
+         FROM role_reward
+         WHERE guild_id = $1
+         ORDER BY COALESCE(level, start_level), rule_type, role_id`,
         [guildId],
       );
       return rows.map((r) => ({
-        level: r.level ?? 0,
+        type: r.rule_type,
+        level: (r.rule_type === 'exact' ? r.level : r.start_level) ?? 0,
+        everyN: r.rule_type === 'recurring' ? (r.every_n ?? 1) : null,
         roleId: r.role_id,
         brokenReason: r.broken_reason,
       }));
@@ -534,6 +604,25 @@ export function createAuditRepository(db: Database): AuditRepository {
     },
 
     async recent(guildId, limit = 25) {
+      return this.search(guildId, { limit });
+    },
+
+    /**
+     * The audit log, filtered (roadmap M15).
+     *
+     * Every filter is optional and expressed as `($n IS NULL OR column = $n)`
+     * rather than by concatenating a WHERE clause: one prepared statement, no
+     * string building anywhere near user input, and the planner still uses
+     * `audit_log_target_idx` when the target filter is supplied.
+     *
+     * `action` accepts a trailing dot as a prefix — `xp.` finds every `xp.*`
+     * action — because "show me everything anyone did to member XP" is the
+     * question, and naming all six actions is not how anyone asks it.
+     */
+    async search(guildId, query) {
+      const action = query.action?.trim() || null;
+      const prefix = action !== null && action.endsWith('.') ? action : null;
+
       const { rows } = await db.query<{
         actor_id: string | null;
         action: string;
@@ -541,11 +630,27 @@ export function createAuditRepository(db: Database): AuditRepository {
         before: unknown;
         after: unknown;
         reason: string | null;
+        created_at: Date;
       }>(
-        `SELECT actor_id, action, target_user_id, before, after, reason
-         FROM audit_log WHERE guild_id = $1 ORDER BY created_at DESC LIMIT $2`,
-        [guildId, limit],
+        `SELECT actor_id, action, target_user_id, before, after, reason, created_at
+         FROM audit_log
+         WHERE guild_id = $1
+           AND ($2::bigint IS NULL OR target_user_id = $2::bigint)
+           AND ($3::bigint IS NULL OR actor_id = $3::bigint)
+           AND ($4::text   IS NULL OR action = $4::text)
+           AND ($5::text   IS NULL OR action LIKE $5::text || '%')
+         ORDER BY created_at DESC, id DESC
+         LIMIT $6`,
+        [
+          guildId,
+          query.targetUserId ?? null,
+          query.actorId ?? null,
+          prefix === null ? action : null,
+          prefix,
+          Math.min(Math.max(query.limit ?? 25, 1), 100),
+        ],
       );
+
       return rows.map((r) => ({
         actorId: r.actor_id,
         action: r.action,
@@ -553,7 +658,16 @@ export function createAuditRepository(db: Database): AuditRepository {
         before: r.before,
         after: r.after,
         reason: r.reason,
+        createdAt: r.created_at,
       }));
+    },
+
+    async actions(guildId) {
+      const { rows } = await db.query<{ action: string }>(
+        `SELECT DISTINCT action FROM audit_log WHERE guild_id = $1 ORDER BY action`,
+        [guildId],
+      );
+      return rows.map((r) => r.action);
     },
   };
 }

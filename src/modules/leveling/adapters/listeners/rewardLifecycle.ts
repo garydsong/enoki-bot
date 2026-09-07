@@ -1,6 +1,6 @@
 import { Events, type GuildMember, type Role } from 'discord.js';
 import type { ListenerDefinition, ModuleContext } from '../../../../platform/plugin/types.js';
-import type { ConfigCache, RuleRepository } from '../../ports/config.js';
+import type { AuditRepository, ConfigCache, RuleRepository } from '../../ports/config.js';
 import type { MemberXpRepository } from '../../ports/memberXp.js';
 import type { RewardReconciler } from '../effects/rewardReconciler.js';
 
@@ -17,6 +17,7 @@ export interface RewardLifecycleDeps {
   readonly configs: ConfigCache;
   readonly memberXp: MemberXpRepository;
   readonly rules: RuleRepository;
+  readonly audit: AuditRepository;
 }
 
 /**
@@ -90,16 +91,51 @@ export function createRoleDeleteListener(deps: RewardLifecycleDeps): ListenerDef
   };
 }
 
-/** Also used when a member leaves, so boards can hide them. */
+/**
+ * A member leaving.
+ *
+ * The default is to MARK them, never delete: XP survives a leave (ADR-014), so
+ * a rejoin restores everything, and `hideDepartedMembers` decides whether the
+ * boards show them meanwhile.
+ *
+ * `auto_reset_on_leave` is the opt-out, for servers that treat leaving as
+ * starting over. It is off by default because the surprising behaviour is the
+ * destructive one — someone who leaves by accident and comes straight back
+ * expects their level to still be there — and it is AUDITED, because
+ * "everything I earned is gone" is a support question that needs an answer.
+ */
 export function createMemberLeaveListener(deps: RewardLifecycleDeps): ListenerDefinition {
   return {
     event: Events.GuildMemberRemove,
-    handle: async (_ctx: ModuleContext, ...args: unknown[]) => {
+    handle: async (ctx: ModuleContext, ...args: unknown[]) => {
       const member = args[0] as GuildMember;
-      // Marked, never deleted: XP survives a leave (ADR-014) so a rejoin
-      // restores everything. `hideDepartedMembers` decides whether boards show
-      // them meanwhile.
-      await deps.memberXp.markDeparted(member.guild.id, member.id, true);
+      if (member.user?.bot) return;
+
+      const config = await deps.configs.get(member.guild.id);
+
+      if (!config.autoResetOnLeave) {
+        await deps.memberXp.markDeparted(member.guild.id, member.id, true);
+        return;
+      }
+
+      const result = await deps.memberXp.forget(member.guild.id, member.id);
+      if (result.xpRows === 0 && result.statRows === 0) return;
+
+      // The record of the deletion outlives the data, which is the point: the
+      // audit entry holds the member's id and the total erased, and nothing
+      // else — no name, no content.
+      await deps.audit.record(member.guild.id, {
+        actorId: null,
+        action: 'xp.auto_reset_on_leave',
+        targetUserId: member.id,
+        before: { totalXp: result.totalXpErased },
+        after: { deleted: true },
+      });
+
+      ctx.log.info(
+        { guildId: member.guild.id, userId: member.id, totalXp: result.totalXpErased },
+        'member left and auto_reset_on_leave erased their data',
+      );
     },
   };
 }

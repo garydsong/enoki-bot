@@ -6,8 +6,12 @@ import {
 } from 'discord.js';
 import type { CommandDefinition, ModuleContext } from '../../../../platform/plugin/types.js';
 import type { XpAwarder } from '../../application/awardXp.js';
+import type { ImportMode, ImportPlan, XpImporter } from '../../application/xpImport.js';
 import { getCurve } from '../../domain/curve/curve.js';
+import type { XpImportError } from '../../domain/import/csv.js';
+import { validateDiscordCdnUrl } from '../../domain/net/discordCdn.js';
 import type {
+  AuditEntry,
   AuditRepository,
   ConfigCache,
   ConfigRepository,
@@ -37,6 +41,7 @@ export interface XpAdminDeps {
   readonly config: ConfigRepository;
   readonly configs: ConfigCache;
   readonly audit: AuditRepository;
+  readonly importer: XpImporter;
 }
 
 export function createXpCommand(deps: XpAdminDeps): CommandDefinition {
@@ -51,12 +56,19 @@ export function createXpCommand(deps: XpAdminDeps): CommandDefinition {
         await interaction.editReply('This command only works inside a server.');
         return;
       }
-      if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+
+      const sub = interaction.options.getSubcommand();
+
+      // `/xp forget` is the ONE subcommand a member may run without Manage
+      // Server, because MR-7 is a member's right to have their own data
+      // deleted — a right that an admin has to approve is not one. The handler
+      // re-checks: without Manage Server you may only name yourself.
+      if (sub !== 'forget' && !interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
         await interaction.editReply('You need the **Manage Server** permission to adjust XP.');
         return;
       }
 
-      switch (interaction.options.getSubcommand()) {
+      switch (sub) {
         case 'add':
           return adjust(interaction, deps, ctx, 1);
         case 'remove':
@@ -67,6 +79,10 @@ export function createXpCommand(deps: XpAdminDeps): CommandDefinition {
           return resetMember(interaction, deps, ctx);
         case 'reset-server':
           return resetGuild(interaction, deps, ctx);
+        case 'import':
+          return importXp(interaction, deps, ctx);
+        case 'forget':
+          return forgetMember(interaction, deps, ctx);
         case 'audit':
           return showAudit(interaction, deps);
         default:
@@ -149,7 +165,65 @@ function buildData() {
         ),
     )
     .addSubcommand((sub) =>
-      sub.setName('audit').setDescription('Show recent administrative changes'),
+      sub
+        .setName('import')
+        .setDescription('Import XP from a CSV file (from Arcane, MEE6, a spreadsheet…)')
+        .addAttachmentOption((o) =>
+          o
+            .setName('file')
+            .setDescription('A CSV with a user id column and an XP column')
+            .setRequired(true),
+        )
+        .addStringOption((o) =>
+          o
+            .setName('mode')
+            .setDescription('Replace each member’s total, or add to it')
+            .addChoices(
+              { name: 'set — replace their total (default)', value: 'set' },
+              { name: 'add — add to their existing total', value: 'add' },
+            ),
+        )
+        .addBooleanOption((o) =>
+          o
+            .setName('apply')
+            .setDescription('Actually import (default: show what would happen)'),
+        )
+        .addBooleanOption((o) =>
+          o
+            .setName('skip-invalid')
+            .setDescription('Import the good rows and ignore the bad ones'),
+        ),
+    )
+    .addSubcommand((sub) =>
+      sub
+        .setName('forget')
+        .setDescription('Permanently delete a member’s leveling data')
+        .addUserOption((o) =>
+          o.setName('user').setDescription('Who (members may only name themselves)'),
+        )
+        .addBooleanOption((o) =>
+          o.setName('confirm').setDescription('This cannot be undone').setRequired(true),
+        ),
+    )
+    .addSubcommand((sub) =>
+      sub
+        .setName('audit')
+        .setDescription('Show recent administrative changes')
+        .addUserOption((o) => o.setName('user').setDescription('Only entries about this member'))
+        .addUserOption((o) => o.setName('actor').setDescription('Only entries by this admin'))
+        .addStringOption((o) =>
+          o
+            .setName('action')
+            .setDescription('Exact action, or a prefix like `xp.` or `reward.`')
+            .setMaxLength(40),
+        )
+        .addIntegerOption((o) =>
+          o
+            .setName('limit')
+            .setDescription('How many entries (default 15, max 50)')
+            .setMinValue(1)
+            .setMaxValue(50),
+        ),
     )
     .toJSON();
 }
@@ -353,30 +427,377 @@ async function resetGuild(
   );
 }
 
+/**
+ * `/xp import` — bring a server's history over from another bot (roadmap M15).
+ *
+ * The command's job is entirely about the moment BEFORE the write: fetch the
+ * file safely, hand it to the importer, and show the admin what it would do.
+ * The default is a preview, and the preview is generated by the same parse and
+ * the same diff that the real import uses.
+ */
+async function importXp(
+  interaction: ChatInputCommandInteraction,
+  deps: XpAdminDeps,
+  ctx: ModuleContext,
+): Promise<void> {
+  const guildId = interaction.guildId as string;
+  const attachment = interaction.options.getAttachment('file', true);
+  const mode = (interaction.options.getString('mode') ?? 'set') as ImportMode;
+  const apply = interaction.options.getBoolean('apply') ?? false;
+  const skipInvalid = interaction.options.getBoolean('skip-invalid') ?? false;
+
+  if (attachment.size > MAX_IMPORT_BYTES) {
+    await interaction.editReply(
+      `That file is ${formatBytes(attachment.size)}; the limit is ` +
+        `${formatBytes(MAX_IMPORT_BYTES)}. Split it and import the parts.`,
+    );
+    return;
+  }
+
+  const text = await fetchAttachment(attachment.url);
+  if (text === null) {
+    await interaction.editReply(
+      'I could not read that file. Attachments have to be uploaded to Discord ' +
+        '(which the `file` option does for you) — a pasted link to somewhere else is refused.',
+    );
+    return;
+  }
+
+  const config = await deps.configs.get(guildId);
+  const plan = await deps.importer.plan(guildId, text, mode, config);
+
+  if (plan.rows.length === 0) {
+    await interaction.editReply({
+      embeds: [
+        new EmbedBuilder()
+          .setTitle('Nothing to import')
+          .setDescription(
+            'No usable rows were found. The file needs a Discord **user id** column and an ' +
+              '**XP** column — either named (`user_id,xp`) or as the first two columns.',
+          )
+          .addFields(errorField(plan.errors)),
+      ],
+    });
+    return;
+  }
+
+  if (plan.errors.length > 0 && !skipInvalid) {
+    await interaction.editReply({
+      embeds: [
+        new EmbedBuilder()
+          .setTitle('Import refused — the file has problems')
+          .setDescription(
+            `${formatNumber(plan.rows.length)} rows are fine and ` +
+              `${formatNumber(plan.errors.length)} are not.\n\n` +
+              'Nothing was imported. Fix the file, or re-run with `skip-invalid: True` to ' +
+              'import the good rows only.\n\n' +
+              '*A bad row is usually a sign the wrong column was read — check the first ' +
+              'few before skipping them.*',
+          )
+          .addFields(errorField(plan.errors)),
+      ],
+    });
+    return;
+  }
+
+  if (!apply) {
+    await interaction.editReply({
+      embeds: [planEmbed(plan, mode, config.curve.maxLevel).setFooter({
+        text: 'Nothing was changed. Run it again with apply:True to import.',
+      })],
+    });
+    return;
+  }
+
+  const result = await deps.importer.apply(guildId, plan.rows, mode, config);
+
+  await deps.audit.record(guildId, {
+    actorId: interaction.user.id,
+    action: 'xp.import',
+    after: {
+      mode,
+      rows: plan.rows.length,
+      applied: result.applied,
+      skipped: plan.errors.length,
+      failedAtBatch: result.failedAtBatch,
+    },
+  });
+
+  ctx.log.warn(
+    { guildId, actor: interaction.user.id, mode, applied: result.applied },
+    'xp import performed',
+  );
+
+  const embed = planEmbed(plan, mode, config.curve.maxLevel).setTitle(
+    result.failedAtBatch === null ? 'Import complete' : 'Import stopped part-way',
+  );
+
+  if (result.failedAtBatch !== null) {
+    embed.addFields({
+      name: '❌ Stopped',
+      value:
+        `${formatNumber(result.applied)} of ${formatNumber(plan.rows.length)} rows were ` +
+        `committed before batch ${result.failedAtBatch} failed:\n\`${result.error ?? 'unknown'}\`\n` +
+        'Each batch is its own transaction, so the failed one changed nothing. ' +
+        'Re-running in `set` mode is safe — it is idempotent.',
+    });
+  } else {
+    embed.setFooter({
+      text:
+        'Reward roles are not granted automatically — run `/level reward backfill` next.',
+    });
+  }
+
+  await interaction.editReply({ embeds: [embed] });
+}
+
+/** 5 MB. About 200,000 rows, which is more members than Discord allows. */
+const MAX_IMPORT_BYTES = 5 * 1024 * 1024;
+
+/**
+ * Read the attachment.
+ *
+ * The URL is re-validated against the CDN allowlist even though it came from
+ * Discord's own attachment object, for the same reason the card renderer does:
+ * this is the last gate before the process makes an outbound request, and a
+ * gate that trusts its caller is not a gate. `redirect: 'error'` closes the
+ * other half — an allowed host must not be able to bounce us elsewhere.
+ */
+async function fetchAttachment(url: string): Promise<string | null> {
+  const validated = validateDiscordCdnUrl(url);
+  if (!validated.ok) return null;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 10_000);
+  try {
+    const response = await fetch(validated.url, {
+      signal: controller.signal,
+      redirect: 'error',
+    });
+    if (!response.ok) return null;
+
+    const buffer = Buffer.from(await response.arrayBuffer());
+    // Checked again after the fact: the attachment's declared size is a claim.
+    if (buffer.byteLength > MAX_IMPORT_BYTES) return null;
+    return buffer.toString('utf8');
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function planEmbed(plan: ImportPlan, mode: ImportMode, maxLevel: number | null): EmbedBuilder {
+  const delta = plan.resultingXp - plan.currentXp;
+  const embed = new EmbedBuilder()
+    .setTitle('Import preview')
+    .setDescription(
+      mode === 'set'
+        ? '**set** — each member’s total is REPLACED by the value in the file.'
+        : '**add** — the value in the file is ADDED to what they already have.',
+    )
+    .addFields(
+      { name: 'Rows', value: formatNumber(plan.rows.length), inline: true },
+      { name: 'Already here', value: formatNumber(plan.existing), inline: true },
+      { name: 'New members', value: formatNumber(plan.fresh), inline: true },
+      {
+        name: 'XP for these members',
+        value:
+          `${formatNumber(plan.currentXp)} → ${formatNumber(plan.resultingXp)} ` +
+          `(${delta >= 0 ? '+' : ''}${formatNumber(delta)})`,
+      },
+      {
+        name: 'Highest level reached',
+        value:
+          formatNumber(plan.topLevel) +
+          (maxLevel !== null && plan.topLevel >= maxLevel ? ` (capped at ${maxLevel})` : ''),
+      },
+    );
+
+  if (plan.errors.length > 0) {
+    embed.addFields(errorField(plan.errors));
+  }
+  if (mode === 'set' && plan.existing > 0) {
+    embed.addFields({
+      name: '⚠️ Overwrites',
+      value:
+        `${formatNumber(plan.existing)} of these members already have XP here, and ` +
+        '`set` mode replaces it. Use `mode: add` if you meant to combine the two.',
+    });
+  }
+  return embed;
+}
+
+function errorField(errors: readonly XpImportError[]): { name: string; value: string } {
+  if (errors.length === 0) return { name: 'Problems', value: '*none*' };
+  const shown = errors.slice(0, 8);
+  return {
+    name: `Problems (${formatNumber(errors.length)})`,
+    value:
+      shown
+        .map((e) => `Line ${e.line}: ${e.reason}`)
+        .join('\n')
+        .slice(0, 950) + (errors.length > shown.length ? `\n…and ${errors.length - shown.length} more` : ''),
+  };
+}
+
+function formatBytes(bytes: number): string {
+  return bytes < 1024 * 1024
+    ? `${Math.round(bytes / 1024)} KB`
+    : `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/**
+ * `/xp forget` — a member's right to erasure (MR-7, roadmap M15).
+ *
+ * Distinct from `/xp reset`, and the distinction is the whole feature: reset
+ * zeroes the score and keeps the record, this deletes the record. It is also
+ * the one `/xp` subcommand a member may run on themselves without Manage
+ * Server — a deletion right that requires an admin's cooperation is not a
+ * right — while naming SOMEONE ELSE still requires the permission.
+ *
+ * `disableResets` deliberately does NOT block it. That setting exists to stop
+ * an admin wiping the server's scores by accident; using it to prevent a member
+ * deleting their own data would be a different thing wearing its name.
+ */
+async function forgetMember(
+  interaction: ChatInputCommandInteraction,
+  deps: XpAdminDeps,
+  ctx: ModuleContext,
+): Promise<void> {
+  const guildId = interaction.guildId as string;
+  const target = interaction.options.getUser('user') ?? interaction.user;
+  const isSelf = target.id === interaction.user.id;
+
+  if (!isSelf && !interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+    await interaction.editReply(
+      'You can delete your own leveling data, but deleting someone else’s needs the ' +
+        '**Manage Server** permission.',
+    );
+    return;
+  }
+
+  if (!interaction.options.getBoolean('confirm', true)) {
+    await interaction.editReply(
+      'Nothing was deleted. Re-run with `confirm: True`.\n' +
+        'This removes XP, level, statistics, weekly and monthly history and rank card ' +
+        'settings — permanently, with no undo.',
+    );
+    return;
+  }
+
+  const result = await deps.memberXp.forget(guildId, target.id);
+
+  if (result.xpRows === 0 && result.statRows === 0 && result.cardRows === 0) {
+    await interaction.editReply(
+      isSelf
+        ? 'There was nothing stored about you in this server.'
+        : `Nothing is stored about ${target.username} in this server.`,
+    );
+    return;
+  }
+
+  // Recorded because a deletion is exactly the kind of change an admin later
+  // needs to explain. The entry names the member and the totals — not their
+  // content, which was never stored (spec `06` §2.12).
+  await deps.audit.record(guildId, {
+    actorId: interaction.user.id,
+    action: isSelf ? 'xp.forget_self' : 'xp.forget',
+    targetUserId: target.id,
+    before: { totalXp: result.totalXpErased },
+    after: { deleted: true },
+  });
+
+  ctx.log.warn(
+    { guildId, actor: interaction.user.id, target: target.id, ...result },
+    'member leveling data erased',
+  );
+
+  await interaction.editReply(
+    `Deleted${isSelf ? ' your' : ` ${target.username}'s`} leveling data in this server: ` +
+      `${formatNumber(result.totalXpErased)} XP, ${formatNumber(result.periodRows)} period ` +
+      `record(s), ${formatNumber(result.statRows)} statistics row(s) and ` +
+      `${formatNumber(result.cardRows)} card setting(s).\n` +
+      'Reward roles are not removed — ask an admin if you want those taken off too. ' +
+      'Earning XP again from here starts from zero.',
+  );
+}
+
 async function showAudit(
   interaction: ChatInputCommandInteraction,
   deps: XpAdminDeps,
 ): Promise<void> {
-  const entries = await deps.audit.recent(interaction.guildId as string, 15);
+  const target = interaction.options.getUser('user');
+  const actor = interaction.options.getUser('actor');
+  const action = interaction.options.getString('action');
+  const limit = interaction.options.getInteger('limit') ?? 15;
+
+  const entries = await deps.audit.search(interaction.guildId as string, {
+    targetUserId: target?.id ?? null,
+    actorId: actor?.id ?? null,
+    action,
+    limit,
+  });
+
+  const filtered = Boolean(target ?? actor ?? action);
 
   if (entries.length === 0) {
-    await interaction.editReply('No administrative changes have been recorded yet.');
+    await interaction.editReply(
+      filtered
+        ? 'No administrative changes match those filters.'
+        : 'No administrative changes have been recorded yet.',
+    );
     return;
   }
 
   const embed = new EmbedBuilder()
-    .setTitle('Recent administrative changes')
+    .setTitle(filtered ? 'Administrative changes (filtered)' : 'Recent administrative changes')
     .setDescription(
       entries
         .map((entry) => {
-          const actor = entry.actorId ? `<@${entry.actorId}>` : 'system';
-          const target = entry.targetUserId ? ` → <@${entry.targetUserId}>` : '';
+          const when = entry.createdAt
+            ? `<t:${Math.floor(entry.createdAt.getTime() / 1000)}:R> `
+            : '';
+          const by = entry.actorId ? `<@${entry.actorId}>` : 'system';
+          const on = entry.targetUserId ? ` → <@${entry.targetUserId}>` : '';
           const reason = entry.reason ? ` *(${entry.reason})*` : '';
-          return `\`${entry.action}\` by ${actor}${target}${reason}`;
+          return `${when}\`${entry.action}\` by ${by}${on}${reason}${describeChange(entry)}`;
         })
         .join('\n')
         .slice(0, 4000),
     );
 
+  if (filtered) {
+    embed.setFooter({
+      text: [
+        target ? `about ${target.username}` : null,
+        actor ? `by ${actor.username}` : null,
+        action ? `action ${action}` : null,
+      ]
+        .filter(Boolean)
+        .join(' · '),
+    });
+  }
+
   await interaction.editReply({ embeds: [embed] });
+}
+
+/**
+ * " 400 → 900 XP" when both sides are known.
+ *
+ * The audit log stores arbitrary JSON, so this reads defensively and shows
+ * nothing rather than guessing — a malformed entry from an older version must
+ * not break the whole listing.
+ */
+function describeChange(entry: AuditEntry): string {
+  const xpOf = (value: unknown): number | null => {
+    if (typeof value !== 'object' || value === null) return null;
+    const raw = (value as { totalXp?: unknown }).totalXp;
+    return typeof raw === 'number' ? raw : null;
+  };
+
+  const before = xpOf(entry.before);
+  const after = xpOf(entry.after);
+  if (before === null || after === null || before === after) return '';
+  return ` — ${formatNumber(before)} → ${formatNumber(after)} XP`;
 }

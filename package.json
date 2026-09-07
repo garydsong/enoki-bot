@@ -7,7 +7,7 @@
     "node": ">=22"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "tsc -p tsconfig.build.json && node scripts/copy-assets.mjs",
     "start": "node dist/main.js",
     "dev": "tsx watch src/main.ts",
     "typecheck": "tsc --noEmit",
@@ -24,6 +24,7 @@
     "test:integration": "vitest run tests/integration"
   },
   "dependencies": {
+    "@napi-rs/canvas": "^1.0.8",
     "discord.js": "^14.27.0",
     "luxon": "^3.5.0",
     "pg": "^8.23.0",
